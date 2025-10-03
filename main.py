@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify
 import requests
 
-# try import SDK
 try:
     import dhanhq
 except Exception:
@@ -32,18 +31,18 @@ IDX_KEY = os.getenv('IDX_KEY') or "IDX_I"
 NIFTY_EXPIRY = os.getenv('NIFTY_EXPIRY') or ""
 BANKNIFTY_EXPIRY = os.getenv('BANKNIFTY_EXPIRY') or ""
 
-# control REST behaviour
+# Controls
 DISABLE_REST = os.getenv('DISABLE_REST', "false").lower() in ("1","true","yes")
-# initial cooldown (seconds) after REST failure; exponential backoff will multiply it
-REST_COOLDOWN_BASE = int(os.getenv('REST_COOLDOWN_BASE') or 300)  # default 5 minutes
-REST_COOLDOWN_MAX = int(os.getenv('REST_COOLDOWN_MAX') or 3600)   # cap 1 hour
+REST_COOLDOWN_BASE = int(os.getenv('REST_COOLDOWN_BASE') or 300)
+REST_COOLDOWN_MAX = int(os.getenv('REST_COOLDOWN_MAX') or 3600)
+INCOMPLETE_ALERT_COOLDOWN = int(os.getenv('INCOMPLETE_ALERT_COOLDOWN') or 600)  # seconds: limit incomplete alerts
 
 REQUIRED = [DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELE_TOKEN, TELE_CHAT_ID]
 
 app = Flask(__name__)
 
-# track cooldown state per underlying (keyed by "IDX_I:13")
-_rest_state = {}  # key -> {"cooldown_until": ts, "backoff": n}
+_rest_state = {}
+_last_incomplete_alert = 0.0
 
 def tele_send_http(chat_id: str, text: str):
     try:
@@ -62,89 +61,73 @@ def tele_send_http(chat_id: str, text: str):
         logger.exception("Failed to send Telegram message: %s", e)
         return False
 
-# ---------------- Dhan client creation ----------------
+# --- make_dhan same robust factory as before ---
 def make_dhan():
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
         raise RuntimeError("Missing DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN")
     if dhanhq is None:
-        raise RuntimeError("dhanhq package not importable in current environment")
-    # Try common constructors
+        raise RuntimeError("dhanhq package not importable")
     try:
         if hasattr(dhanhq, "dhanhq") and callable(getattr(dhanhq, "dhanhq")):
-            try:
-                return dhanhq.dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-            except:
-                pass
+            try: return dhanhq.dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+            except: pass
         if hasattr(dhanhq, "DhanContext") and callable(getattr(dhanhq, "DhanContext")):
             try:
                 ctx = dhanhq.DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
                 if hasattr(dhanhq, "dhanhq") and callable(getattr(dhanhq, "dhanhq")):
                     return dhanhq.dhanhq(ctx)
                 return ctx
-            except:
-                pass
+            except: pass
         if hasattr(dhanhq, "Client") and callable(getattr(dhanhq, "Client")):
             try:
                 return dhanhq.Client(client_id=DHAN_CLIENT_ID, access_token=DHAN_ACCESS_TOKEN)
             except:
-                try:
-                    return dhanhq.Client(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-                except:
-                    pass
+                try: return dhanhq.Client(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+                except: pass
     except Exception:
         pass
-    raise RuntimeError("Could not construct dhanhq client with available module shape.")
+    raise RuntimeError("Could not construct dhanhq client; check installed package shape.")
 
-# ---------------- expiry helpers ----------------
+# --- expiry helpers (dates) ---
 def weekly_expiry_for_index(index_name):
     today = datetime.now().date()
-    if index_name == "NIFTY":
-        target = 3
-    else:
-        target = 2
+    target = 3 if index_name == "NIFTY" else 2
     days_ahead = (target - today.weekday()) % 7
-    if days_ahead == 0:
-        days_ahead = 7
+    if days_ahead == 0: days_ahead = 7
     return today + timedelta(days=days_ahead)
 
 def expiry_variants(date_obj):
-    iso = date_obj.strftime("%Y-%m-%d")
-    ddmmmy = date_obj.strftime("%d-%b-%Y")
-    ymdc = date_obj.strftime("%Y%m%d")
-    ddmmy = date_obj.strftime("%d-%m-%Y")
-    return [iso, ddmmmy, ymdc, ddmmy]
+    return [
+        date_obj.strftime("%Y-%m-%d"),
+        date_obj.strftime("%d-%b-%Y"),
+        date_obj.strftime("%Y%m%d"),
+        date_obj.strftime("%d-%m-%Y"),
+    ]
 
-# ---------------- SDK/REST helpers ----------------
+# --- SDK / REST helpers (with backoff) ---
 def try_quote_data(dhan, exchange_key, underlying_id):
     payload = {"securities": {exchange_key: [int(underlying_id)]}}
     try:
-        try:
-            return dhan.quote_data(securities=payload["securities"])
-        except TypeError:
-            return dhan.quote_data(payload)
+        try: return dhan.quote_data(securities=payload["securities"])
+        except TypeError: return dhan.quote_data(payload)
         except Exception:
-            try:
-                return dhan.quote_data(payload["securities"])
-            except:
-                return None
+            try: return dhan.quote_data(payload["securities"])
+            except: return None
     except Exception as e:
         logger.debug("try_quote_data fatal: %s", e)
         return None
 
 def _rest_allowed(exchange_key, underlying_id):
-    if DISABLE_REST:
-        return False
+    if DISABLE_REST: return False
     key = f"{exchange_key}:{underlying_id}"
     st = _rest_state.get(key)
-    if not st:
-        return True
+    if not st: return True
     return time.time() > st.get("cooldown_until", 0)
 
 def _update_rest_failure(exchange_key, underlying_id):
     key = f"{exchange_key}:{underlying_id}"
     st = _rest_state.get(key, {"backoff": 0})
     st["backoff"] = min(st.get("backoff", 0) + 1, 10)
-    # exponential backoff: base * 2^(backoff-1)
     delay = REST_COOLDOWN_BASE * (2 ** (st["backoff"] - 1)) if st["backoff"] > 0 else REST_COOLDOWN_BASE
     delay = min(delay, REST_COOLDOWN_MAX)
     st["cooldown_until"] = time.time() + delay
@@ -153,23 +136,14 @@ def _update_rest_failure(exchange_key, underlying_id):
 
 def _clear_rest_failure(exchange_key, underlying_id):
     key = f"{exchange_key}:{underlying_id}"
-    if key in _rest_state:
-        del _rest_state[key]
+    if key in _rest_state: del _rest_state[key]
 
 def rest_option_chain(underlying_id, exchange_key, expiry_date):
-    """
-    Try REST option-chain for multiple expiry formats; implement cooldown/backoff on failures.
-    Returns JSON or None.
-    """
     if not _rest_allowed(exchange_key, underlying_id):
-        logger.info("REST not allowed now for %s:%s due to cooldown", exchange_key, underlying_id)
+        logger.info("REST not allowed for %s:%s due to cooldown", exchange_key, underlying_id)
         return None
     url = "https://api.dhan.co/v2/option-chain"
-    headers = {
-        "access-token": DHAN_ACCESS_TOKEN,
-        "client-id": DHAN_CLIENT_ID,
-        "Content-Type": "application/json"
-    }
+    headers = {"access-token": DHAN_ACCESS_TOKEN, "client-id": DHAN_CLIENT_ID, "Content-Type": "application/json"}
     for exp in expiry_variants(expiry_date):
         payload = {"UnderlyingScrip": int(underlying_id), "UnderlyingSeg": exchange_key, "Expiry": exp}
         try:
@@ -179,24 +153,15 @@ def rest_option_chain(underlying_id, exchange_key, expiry_date):
             _update_rest_failure(exchange_key, underlying_id)
             continue
         if r.status_code == 200:
-            try:
-                j = r.json()
+            try: j = r.json()
             except Exception:
                 logger.warning("REST returned non-json for expiry %s", exp)
                 _update_rest_failure(exchange_key, underlying_id)
                 continue
-            # handle failure wrapper from API
             if isinstance(j, dict) and j.get("status") and str(j.get("status")).lower() == "failure":
                 logger.info("REST response failure for expiry %s: %s", exp, (j.get("data") or j.get("remarks") or j))
-                # if message contains rate-limit / blocked -> set failure
-                err_text = json.dumps(j.get("data") or j)
-                if "Too many requests" in err_text or "blocked" in err_text or "Too many" in err_text:
-                    _update_rest_failure(exchange_key, underlying_id)
-                else:
-                    # treat as unusable response but not necessarily rate-limit
-                    _update_rest_failure(exchange_key, underlying_id)
+                _update_rest_failure(exchange_key, underlying_id)
                 continue
-            # successful usable response; clear any failure state
             _clear_rest_failure(exchange_key, underlying_id)
             return j
         else:
@@ -206,23 +171,15 @@ def rest_option_chain(underlying_id, exchange_key, expiry_date):
                 _update_rest_failure(exchange_key, underlying_id)
                 return None
             if r.status_code == 404:
-                # endpoint might be invalid — set cooldown longer
                 logger.warning("REST 404 for %s expiry %s; backing off.", exchange_key, exp)
                 _update_rest_failure(exchange_key, underlying_id)
-                # try next expiry variant but likely all will 404 -> will go to cooldown
                 continue
-            # other codes -> backoff a bit and continue
             _update_rest_failure(exchange_key, underlying_id)
             continue
-    # tried all variants -> set cooldown
     _update_rest_failure(exchange_key, underlying_id)
     return None
 
 def try_option_chain_sdk(dhan, underlying_id, expiry_date, exchange_key):
-    """
-    Try various argument shapes and expiry variants for SDK option_chain.
-    Returns dict or None.
-    """
     expiry_vals = expiry_variants(expiry_date)
     bases = [
         {"under_security_id": int(underlying_id), "under_exchange_segment": exchange_key},
@@ -257,11 +214,10 @@ def try_option_chain_sdk(dhan, underlying_id, expiry_date, exchange_key):
     logger.debug("SDK option_chain attempts: %s", attempts)
     return None
 
-# ---------------- normalization & spot extraction helpers ----------------
+# --- parsing & formatting (same as earlier, unchanged) ---
 def safe_get_ltp_from_quote_response(resp):
     try:
-        if not resp:
-            return None
+        if not resp: return None
         if isinstance(resp, dict):
             data = resp.get("data", resp.get("Data", resp))
             if isinstance(data, dict):
@@ -270,29 +226,22 @@ def safe_get_ltp_from_quote_response(resp):
                         item = v[0]
                         for k in ("LTP","ltp","lastPrice","last_price","last"):
                             if k in item and item[k] not in (None, ""):
-                                try:
-                                    return float(item[k])
-                                except:
-                                    pass
+                                try: return float(item[k])
+                                except: pass
                 for k in ("LTP","ltp","lastPrice","last_price","last"):
                     if k in data and data[k] not in (None, ""):
-                        try:
-                            return float(data[k])
-                        except:
-                            pass
+                        try: return float(data[k])
+                        except: pass
             if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
                 item = data[0]
                 for k in ("LTP","ltp","lastPrice","last_price","last"):
                     if k in item and item[k] not in (None, ""):
-                        try:
-                            return float(item[k])
-                        except:
-                            pass
+                        try: return float(item[k])
+                        except: pass
         s = str(resp)
         import re
         m = re.search(r'ltp[^\d]*([\d]+\.[\d]+|[\d]+)', s, re.IGNORECASE)
-        if m:
-            return float(m.group(1))
+        if m: return float(m.group(1))
         return None
     except Exception as e:
         logger.debug("safe_get_ltp fail: %s", e)
@@ -301,50 +250,40 @@ def safe_get_ltp_from_quote_response(resp):
 def extract_spot_from_chain(raw):
     try:
         preview = ""
-        if not raw:
-            return None, preview, False
-        try:
-            preview = json.dumps(raw)[:1200]
-        except:
-            preview = str(raw)[:1200]
-        # if API explicitly failure -> not usable
+        if not raw: return None, preview, False
+        try: preview = json.dumps(raw)[:1200]
+        except: preview = str(raw)[:1200]
         if isinstance(raw, dict) and raw.get("status") and str(raw.get("status")).lower() == "failure":
             return None, preview, False
         def to_num(v):
             try:
                 if v is None: return None
                 if isinstance(v, (int,float)): return float(v)
-                s = str(v).strip().replace(',', '')
+                s = str(v).strip().replace(',','')
                 if s == "": return None
-                if any(c.isalpha() for c in s) and not any(ch.isdigit() for ch in s):
-                    return None
+                if any(c.isalpha() for c in s) and not any(ch.isdigit() for ch in s): return None
                 return float(s)
-            except:
-                return None
+            except: return None
         patterns = ("underlying","underlyinglast","underlyinglastprice","underlying_price","underlyingltp","spot","ltp","lastprice","last_price","last")
         found=[]
         def recurse(o):
             if o is None: return
             if isinstance(o, dict):
                 for k,v in o.items():
-                    lk = str(k).lower()
+                    lk=str(k).lower()
                     for p in patterns:
                         if p in lk:
-                            n = to_num(v)
+                            n=to_num(v)
                             if n is not None:
                                 found.append(n); return
                     recurse(v)
             elif isinstance(o, list):
-                for item in o[:200]:
-                    recurse(item)
+                for item in o[:200]: recurse(item)
             else:
-                n = to_num(o)
-                if n is not None:
-                    found.append(n)
+                n=to_num(o)
+                if n is not None: found.append(n)
         recurse(raw)
-        if found:
-            return float(found[0]), preview, False
-        # infer from strikes
+        if found: return float(found[0]), preview, False
         strikes=[]
         data = raw.get("data") if isinstance(raw, dict) and "data" in raw else raw
         target = data
@@ -485,10 +424,11 @@ def bot_loop():
         tele_send_http(TELE_CHAT_ID, f"❌ Dhan init failed: {e}")
         return
 
-    iter_no=0
+    global _last_incomplete_alert
+    iteration = 0
     while True:
-        iter_no+=1
-        logger.info("=== Iteration #%d ===", iter_no)
+        iteration += 1
+        logger.info("=== Iteration #%d ===", iteration)
         try:
             nifty_expiry_date = datetime.strptime(NIFTY_EXPIRY, "%Y-%m-%d").date() if NIFTY_EXPIRY else weekly_expiry_for_index("NIFTY")
             bank_expiry_date = datetime.strptime(BANKNIFTY_EXPIRY, "%Y-%m-%d").date() if BANKNIFTY_EXPIRY else weekly_expiry_for_index("BANKNIFTY")
@@ -529,7 +469,10 @@ def bot_loop():
                 logger.info("Sent NIFTY option chain (strikes=%d)", len(strikes))
             else:
                 logger.warning("Could not fetch complete NIFTY data (spot:%s, chain:%s)", bool(spot_n), bool(raw_chain_n))
-                tele_send_http(TELE_CHAT_ID, f"⚠️ NIFTY fetch incomplete. spot={spot_n is not None}, chain={raw_chain_n is not None}")
+                # send incomplete alert only if cooldown expired
+                if time.time() - _last_incomplete_alert > INCOMPLETE_ALERT_COOLDOWN:
+                    tele_send_http(TELE_CHAT_ID, f"⚠️ NIFTY fetch incomplete. spot={spot_n is not None}, chain={raw_chain_n is not None}")
+                    _last_incomplete_alert = time.time()
 
             time.sleep(1)
 
@@ -569,7 +512,9 @@ def bot_loop():
                 logger.info("Sent BANKNIFTY option chain (strikes=%d)", len(strikes_b))
             else:
                 logger.warning("Could not fetch complete BANKNIFTY data (spot:%s, chain:%s)", bool(spot_b), bool(raw_chain_b))
-                tele_send_http(TELE_CHAT_ID, f"⚠️ BANKNIFTY fetch incomplete. spot={spot_b is not None}, chain={raw_chain_b is not None}")
+                if time.time() - _last_incomplete_alert > INCOMPLETE_ALERT_COOLDOWN:
+                    tele_send_http(TELE_CHAT_ID, f"⚠️ BANKNIFTY fetch incomplete. spot={spot_b is not None}, chain={raw_chain_b is not None}")
+                    _last_incomplete_alert = time.time()
 
         except Exception as e:
             logger.exception("Error in bot loop: %s", e)
