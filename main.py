@@ -109,21 +109,21 @@ def get_instruments(dhan):
                 if i >= 50: break
                 sample.append(r.get("SEM_TRADING_SYMBOL") or r.get("SM_SYMBOL_NAME") or '')
             logger.warning("Sample symbols (first 50): %s", sample[:20])
+
         return fno_instruments
 
     except Exception as e:
         logger.exception("❌ Error fetching instruments: %s", e)
         return []
 
-# ---------------- New helper: robust method discovery & call -----------------
+# ---------------- New helper: robust method discovery & call (improved) -----------------
 def discover_dhan_methods(dhan):
     """Return callable names on the dhan object useful for market data."""
     try:
         methods = [m for m in dir(dhan) if callable(getattr(dhan, m))]
-        # filter likely candidates by name
-        candidates = [m for m in methods if any(x in m.lower() for x in ('quote','market','ltp','price','get'))]
-        logger.debug("dhan callable candidates (len=%d): %s", len(candidates), candidates[:50])
-        return candidates
+        # keep all for logging but we'll prioritize quote-like names later
+        logger.debug("dhan callable candidates (len=%d): %s", len(methods), methods[:60])
+        return methods
     except Exception as e:
         logger.exception("discover_dhan_methods failed: %s", e)
         return []
@@ -132,78 +132,96 @@ def try_dhan_quote(dhan, security_id=None, symbol=None, exchange_segment=None):
     """
     Try a list of common method names and argument patterns on the dhan object
     to fetch a market quote. Return a normalized dict on success, else None.
+    - Prioritize quote-like methods (quote_data, quote, ltp, etc).
+    - Avoid calling order/historical methods with no_args.
     """
     try:
-        # candidate method names to try (ordered)
-        name_candidates = [
-            'market_quote','get_market_quote','get_quote','quote','get_quotes','quotes',
-            'getLTP','ltp','get_ltp','get_quotes_by_security','get_quote_by_security_id',
-            'get_quote_by_symbol','fetch_quote','fetch_market_quote','getMarketData','getMarketQuote'
+        # priority list: quote-like methods first
+        preferred = [
+            'quote_data', 'get_quote', 'get_market_quote', 'market_quote', 'get_quotes',
+            'get_quote_by_security_id', 'get_quote_by_symbol', 'get_quotes_by_security',
+            'get_ltp', 'ltp', 'get_ltp_by_security', 'getMarketData', 'getMarketQuote', 'quote'
         ]
 
-        # also include discovered methods from object (helps custom SDKs)
         discovered = discover_dhan_methods(dhan)
-        for d in discovered:
-            if d not in name_candidates:
-                name_candidates.append(d)
+        # build final candidate list: preferred first, then discovered (keeping unique)
+        name_candidates = []
+        for n in preferred:
+            if n not in name_candidates:
+                name_candidates.append(n)
+        for n in discovered:
+            if n not in name_candidates:
+                name_candidates.append(n)
 
-        # try calling with different arg patterns
+        logger.debug("try_dhan_quote: candidate order: %s", name_candidates[:40])
+
+        # blacklist for no-arg calls (these are account/order related and shouldn't be no-arg)
+        no_args_blacklist = {'get_forever', 'get_order_list', 'get_holdings', 'get_positions',
+                             'get_trade_book', 'get_trade_history', 'get_order_by_id', 'get_fund_limits'}
+
         for name in name_candidates:
             if not hasattr(dhan, name):
                 continue
             method = getattr(dhan, name)
-            # try keyword args first
-            tried = []
+            logger.debug("try_dhan_quote: trying method %s", name)
+            # try patterns in order: keyword security_id+exchange, positional security_id, symbol
+            # do not call no_args unless method seems quote-like
+            tried_patterns = []
             try:
-                # pattern 1: security_id + exchange_segment
+                # 1) keyword security_id + exchange_segment
                 if security_id is not None:
                     try:
                         resp = method(security_id=str(security_id), exchange_segment=exchange_segment)
-                        tried.append((name, 'security_id, exchange_segment'))
-                        if resp and isinstance(resp, dict) and any(k.lower() in str(resp).lower() for k in ('ltp','open_interest','status','data')):
-                            logger.debug("try_dhan_quote: got response from %s with security_id", name)
+                        tried_patterns.append('security_id_kw')
+                        if resp and isinstance(resp, dict) and any(k.lower() in str(resp).lower() for k in ('ltp','open_interest','status','data','last_price')):
+                            logger.debug("try_dhan_quote: got response from %s with security_id_kw", name)
                             return resp
-                    except Exception:
-                        pass
-                # pattern 2: security_id only
+                    except Exception as e:
+                        logger.debug("try_dhan_quote: %s security_id_kw failed: %s", name, e)
+                # 2) positional security_id
                 if security_id is not None:
                     try:
                         resp = method(str(security_id))
-                        tried.append((name, 'security_id_pos'))
-                        if resp and isinstance(resp, dict) and any(k.lower() in str(resp).lower() for k in ('ltp','open_interest','status','data')):
-                            logger.debug("try_dhan_quote: got response from %s with sec_id positional", name)
+                        tried_patterns.append('security_id_pos')
+                        if resp and isinstance(resp, dict) and any(k.lower() in str(resp).lower() for k in ('ltp','open_interest','status','data','last_price')):
+                            logger.debug("try_dhan_quote: got response from %s with security_id_pos", name)
                             return resp
-                    except Exception:
-                        pass
-                # pattern 3: symbol
+                    except Exception as e:
+                        logger.debug("try_dhan_quote: %s security_id_pos failed: %s", name, e)
+                # 3) symbol positional
                 if symbol is not None:
                     try:
                         resp = method(symbol)
-                        tried.append((name, 'symbol_pos'))
-                        if resp and isinstance(resp, dict) and any(k.lower() in str(resp).lower() for k in ('ltp','open_interest','status','data')):
+                        tried_patterns.append('symbol_pos')
+                        if resp and isinstance(resp, dict) and any(k.lower() in str(resp).lower() for k in ('ltp','open_interest','status','data','last_price')):
                             logger.debug("try_dhan_quote: got response from %s with symbol_pos", name)
                             return resp
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("try_dhan_quote: %s symbol_pos failed: %s", name, e)
                     try:
                         resp = method(symbol=symbol)
-                        tried.append((name, 'symbol_kw'))
-                        if resp and isinstance(resp, dict) and any(k.lower() in str(resp).lower() for k in ('ltp','open_interest','status','data')):
+                        tried_patterns.append('symbol_kw')
+                        if resp and isinstance(resp, dict) and any(k.lower() in str(resp).lower() for k in ('ltp','open_interest','status','data','last_price')):
                             logger.debug("try_dhan_quote: got response from %s with symbol_kw", name)
                             return resp
-                    except Exception:
-                        pass
-                # pattern 4: no args
-                try:
-                    resp = method()
-                    tried.append((name, 'no_args'))
-                    if resp and isinstance(resp, dict) and any(k.lower() in str(resp).lower() for k in ('ltp','open_interest','status','data')):
-                        logger.debug("try_dhan_quote: got response from %s with no_args", name)
-                        return resp
-                except Exception:
-                    pass
+                    except Exception as e:
+                        logger.debug("try_dhan_quote: %s symbol_kw failed: %s", name, e)
+
+                # 4) no-arg only for quote-like methods and not blacklisted methods
+                lower = name.lower()
+                is_quote_like = any(x in lower for x in ('quote','ltp','market','getmarket','quote_data'))
+                if name not in no_args_blacklist and is_quote_like:
+                    try:
+                        resp = method()
+                        tried_patterns.append('no_args')
+                        if resp and isinstance(resp, dict) and any(k.lower() in str(resp).lower() for k in ('ltp','open_interest','status','data','last_price')):
+                            logger.debug("try_dhan_quote: got response from %s with no_args", name)
+                            return resp
+                    except Exception as e:
+                        logger.debug("try_dhan_quote: %s no_args failed: %s", name, e)
+                logger.debug("try_dhan_quote: method %s tried patterns: %s", name, tried_patterns)
             except Exception as e:
-                logger.debug("try_dhan_quote: attempted %s tries for %s failed: %s", tried, name, e)
+                logger.debug("try_dhan_quote: exception while trying %s: %s", name, e)
                 continue
 
         logger.debug("try_dhan_quote: no candidate method returned a recognizable result")
@@ -220,10 +238,10 @@ def get_spot_price_dhan(dhan, index_name):
         security_id = 13 if index_name == 'NIFTY' else 25
         exchange_seg = getattr(dhan, 'NSE', None) or 'NSE'
 
-        # Try our helper with security_id
+        # Try primary: quote by security id
         resp = try_dhan_quote(dhan, security_id=str(security_id), exchange_segment=exchange_seg, symbol=None)
         if not resp:
-            # try querying by symbol name fallback (some SDKs expect symbol)
+            # try querying by symbol name fallback
             symbol_name = 'NIFTY 50' if index_name == 'NIFTY' else 'BANKNIFTY'
             resp = try_dhan_quote(dhan, security_id=None, exchange_segment=exchange_seg, symbol=symbol_name)
 
@@ -236,9 +254,8 @@ def get_spot_price_dhan(dhan, index_name):
         ltp = None
         if isinstance(data, dict):
             ltp = data.get('LTP') or data.get('ltp') or data.get('last_price') or data.get('lastPrice') or None
-        # if data is nested or list, try string search fallback
         if ltp is None:
-            # crude attempt
+            # crude attempt: search string
             s = str(resp).lower()
             import re
             m = re.search(r'\"?ltp\"?\s*[:=]\s*\"?([\d\.]+)\"?', s)
@@ -264,7 +281,6 @@ def get_option_chain_data(dhan, option_contracts):
             return {}
         logger.info("📡 Fetching data for %d options...", len(option_contracts))
         result = {}
-        # try to detect a good exchange segment constant
         exchange_seg = getattr(dhan, 'NSE_FNO', None) or getattr(dhan, 'FNO', None) or 'NSE_FNO'
 
         for opt in option_contracts[:40]:
@@ -272,16 +288,13 @@ def get_option_chain_data(dhan, option_contracts):
                 sec_id = str(opt.get('security_id') or opt.get('SEM_SMST_SECURITY_ID') or '')
                 if not sec_id:
                     continue
-                # primary: ask by security_id
                 resp = try_dhan_quote(dhan, security_id=sec_id, exchange_segment=exchange_seg)
                 if not resp:
-                    # fallback: try using symbol
                     resp = try_dhan_quote(dhan, security_id=None, symbol=opt.get('symbol'), exchange_segment=exchange_seg)
                 if not resp:
                     logger.warning("No quote for option sec_id=%s symbol=%s", sec_id, opt.get('symbol'))
                     continue
 
-                # normalize
                 data = resp.get('data') if isinstance(resp, dict) and 'data' in resp else resp
                 ltp_val = (data.get('LTP') if isinstance(data, dict) else None) or \
                           (data.get('ltp') if isinstance(data, dict) else None) or \
@@ -299,7 +312,6 @@ def get_option_chain_data(dhan, option_contracts):
                     'volume': int(vol_val) if vol_val not in (None, '') else 0,
                     'change': float(change_val) if change_val not in (None, '') else 0.0
                 }
-                # small sleep to be gentle on API
                 time.sleep(0.08)
             except Exception as e:
                 logger.warning("Failed to get quote for %s: %s", opt.get('security_id'), e)
@@ -311,6 +323,10 @@ def get_option_chain_data(dhan, option_contracts):
     except Exception as e:
         logger.exception("❌ Error fetching option data: %s", e)
         return {}
+
+# (the rest of the file remains same: calculate_strikes, format_option_chain_message, bot_loop, routes)
+# For brevity re-attach the unchanged parts below (copy from your existing file if needed).
+# --- simplified: include the rest exactly as your previous file expects ---
 
 def calculate_strikes(spot_price, index_name, num_strikes=5):
     if index_name == 'NIFTY':
@@ -384,7 +400,6 @@ def bot_loop():
     try:
         dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
         logger.info("✅ DhanHQ initialized successfully!")
-        # Log discovered methods for debugging
         items = discover_dhan_methods(dhan)
         logger.info("dhan object candidate methods: %s", items[:60])
         tele_send_http(TELE_CHAT_ID, f"✅ DhanHQ Option Chain Bot started!\nDetected methods: {items[:10]}")
