@@ -1,4 +1,4 @@
-# main.py (SDK-only, REST disabled by default)
+# main.py (SDK-only, minimal & robust)
 import os
 import time
 import threading
@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timedelta
 from flask import Flask, jsonify
 
+# Try import dependencies
 try:
     import requests
 except Exception:
@@ -35,9 +36,6 @@ IDX_KEY = os.getenv('IDX_KEY') or "IDX_I"
 NIFTY_EXPIRY = os.getenv('NIFTY_EXPIRY') or ""
 BANKNIFTY_EXPIRY = os.getenv('BANKNIFTY_EXPIRY') or ""
 
-# Controls
-# Default: REST disabled to avoid 404 / rate-limit spam.
-DISABLE_REST = os.getenv('DISABLE_REST', "true").lower() in ("1","true","yes")
 INCOMPLETE_ALERT_COOLDOWN = int(os.getenv('INCOMPLETE_ALERT_COOLDOWN') or 600)  # seconds
 
 REQUIRED = [DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELE_TOKEN, TELE_CHAT_ID]
@@ -45,15 +43,14 @@ REQUIRED = [DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELE_TOKEN, TELE_CHAT_ID]
 app = Flask(__name__)
 
 def tele_send_http(chat_id: str, text: str):
-    token = TELE_TOKEN
-    if not token:
+    if not TELE_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set")
         return False
     if requests is None:
-        logger.error("requests not available to send Telegram message")
+        logger.error("requests lib not available")
         return False
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code != 200:
@@ -94,7 +91,7 @@ def make_dhan():
                 except:
                     pass
     except Exception as e:
-        logger.debug("make_dhan attempts: %s", e)
+        logger.debug("make_dhan attempts failed: %s", e)
     raise RuntimeError("Could not construct dhanhq client with available module shape.")
 
 # ---------------- expiry helpers ----------------
@@ -247,7 +244,6 @@ def extract_spot_from_chain(raw):
         recurse(raw)
         if found:
             return float(found[0]), preview, False
-        # infer from strikes
         strikes=[]
         data = raw.get("data") if isinstance(raw, dict) and "data" in raw else raw
         target = data
@@ -350,7 +346,7 @@ def parse_option_chain_raw(raw):
                             except: pass
                     for kk in ('openInterest','OI'):
                         if kk in o and o[kk] not in (None,''):
-                            try: oi=int(float(o[kk])); break
+                            try: oi=int(float(o[kk]); break
                             except: pass
                     for kk in ('volume','Volume'):
                         if kk in o and o[kk] not in (None,''):
@@ -410,7 +406,7 @@ def bot_loop():
             nifty_expiry_date = datetime.strptime(NIFTY_EXPIRY, "%Y-%m-%d").date() if NIFTY_EXPIRY else weekly_expiry_for_index("NIFTY")
             bank_expiry_date = datetime.strptime(BANKNIFTY_EXPIRY, "%Y-%m-%d").date() if BANKNIFTY_EXPIRY else weekly_expiry_for_index("BANKNIFTY")
 
-            # --- NIFTY ---
+            # NIFTY
             spot_n = None
             spot_n_inferred = False
             try:
@@ -427,7 +423,6 @@ def bot_loop():
                     spot_n = s
                     spot_n_inferred = bool(inferred)
 
-            # Only send if we have both chain & spot (spot may be inferred)
             if raw_chain_n and spot_n is not None:
                 gap = 50
                 atm = round(spot_n / gap) * gap
@@ -448,7 +443,7 @@ def bot_loop():
 
             time.sleep(1)
 
-            # --- BANKNIFTY ---
+            # BANKNIFTY
             spot_b = None
             spot_b_inferred = False
             try:
