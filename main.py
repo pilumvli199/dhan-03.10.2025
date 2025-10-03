@@ -346,7 +346,7 @@ def parse_option_chain_raw(raw):
                             except: pass
                     for kk in ('openInterest','OI'):
                         if kk in o and o[kk] not in (None,''):
-                            try: oi=int(float(o[kk]); break
+                            try: oi=int(float(o[kk])); break
                             except: pass
                     for kk in ('volume','Volume'):
                         if kk in o and o[kk] not in (None,''):
@@ -363,7 +363,7 @@ def format_for_telegram(index_name, spot, expiry, strikes, strike_rows, spot_inf
     lines = []
     inferred_note = " (inferred)" if spot_inferred else ""
     lines.append(f"📊 <b>{index_name}</b>  | Spot: <b>₹{spot:,.2f}</b>{inferred_note}  | Expiry: {expiry}")
-    lines.append("<code>  CE_LTP   CE_OI    STRIKE    PE_LTP   PE_OI</code>")
+    lines.append("<code>  CE_LTP     CE_OI     STRIKE     PE_LTP    PE_OI</code>")
     lines.append("─"*60)
     for s in sorted(strikes):
         d = m.get(s, {'CE':{'ltp':0,'oi':0}, 'PE':{'ltp':0,'oi':0}})
