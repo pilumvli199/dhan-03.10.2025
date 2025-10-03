@@ -68,17 +68,33 @@ def get_banknifty_expiry():
 def get_instruments(dhan):
     """Download instruments master file from DhanHQ"""
     try:
-        logger.info("📥 Fetching instruments from DhanHQ...")
+        logger.info("📥 Downloading instruments from DhanHQ API...")
         
-        # Get instruments for F&O segment
-        response = dhan.fetch_security_list(exchange_segment=FNO)
+        # DhanHQ provides direct URL for instruments
+        url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+        response = requests.get(url, timeout=30)
         
-        if response and response.get('status') == 'success':
-            instruments = response.get('data', [])
-            logger.info(f"✅ Downloaded {len(instruments)} F&O instruments")
-            return instruments
+        if response.status_code == 200:
+            import csv
+            from io import StringIO
+            
+            # Parse CSV
+            csv_data = StringIO(response.text)
+            reader = csv.DictReader(csv_data)
+            instruments = list(reader)
+            
+            # Filter F&O instruments (NIFTY and BANKNIFTY options)
+            fno_instruments = [
+                inst for inst in instruments 
+                if inst.get('SEM_EXM_EXCH_ID') == '2'  # 2 = NSE F&O
+                and ('NIFTY' in inst.get('SEM_TRADING_SYMBOL', ''))
+                and inst.get('SEM_INSTRUMENT_NAME') == 'OPTIDX'  # Options on Index
+            ]
+            
+            logger.info(f"✅ Downloaded {len(fno_instruments)} F&O option instruments")
+            return fno_instruments
         else:
-            logger.error(f"Failed to get instruments: {response}")
+            logger.error(f"Failed to download instruments: {response.status_code}")
             return []
             
     except Exception as e:
@@ -90,17 +106,17 @@ def get_spot_price_dhan(dhan, index_name):
     try:
         # DhanHQ Index security IDs
         # NIFTY 50 = 13, BANKNIFTY = 25
-        security_id = "13" if index_name == 'NIFTY' else "25"
+        security_id = 13 if index_name == 'NIFTY' else 25
         
-        # Fetch LTP using quote API
-        response = dhan.get_ltp_data(
-            exchange_segment=IDX,
-            security_id=security_id
+        # Fetch LTP using market quote API
+        response = dhan.market_quote(
+            security_id=str(security_id),
+            exchange_segment=dhan.NSE
         )
         
         if response and response.get('status') == 'success':
             data = response.get('data', {})
-            ltp = data.get('LTP', 0)
+            ltp = float(data.get('LTP', 0))
             logger.info(f"✅ {index_name} Spot: ₹{ltp:,.2f}")
             return ltp
         else:
@@ -175,33 +191,35 @@ def get_option_chain_data(dhan, option_contracts):
         
         logger.info(f"📡 Fetching data for {len(option_contracts)} options...")
         
-        # Prepare security IDs for batch quote
-        security_ids = [str(opt['security_id']) for opt in option_contracts]
+        result = {}
         
-        # Fetch market quotes
-        response = dhan.get_market_quote(
-            exchange_segment=FNO,
-            security_id=','.join(security_ids[:50])  # API limit: 50 at a time
-        )
+        # Fetch quotes in batches (API works better with individual calls)
+        for opt in option_contracts[:20]:  # Limit to 20 for now
+            try:
+                sec_id = str(opt['security_id'])
+                
+                response = dhan.market_quote(
+                    security_id=sec_id,
+                    exchange_segment=dhan.NSE_FNO
+                )
+                
+                if response and response.get('status') == 'success':
+                    data = response.get('data', {})
+                    result[sec_id] = {
+                        'ltp': float(data.get('LTP', 0)),
+                        'oi': int(data.get('open_interest', 0)),
+                        'volume': int(data.get('volume', 0)),
+                        'change': float(data.get('change', 0))
+                    }
+                
+                time.sleep(0.1)  # Small delay between requests
+                
+            except Exception as e:
+                logger.warning(f"Failed to get quote for {sec_id}: {e}")
+                continue
         
-        if response and response.get('status') == 'success':
-            data = response.get('data', {})
-            logger.info(f"✅ Market data received")
-            
-            result = {}
-            for quote in data.values():
-                sec_id = str(quote.get('security_id'))
-                result[sec_id] = {
-                    'ltp': float(quote.get('LTP', 0)),
-                    'oi': int(quote.get('open_interest', 0)),
-                    'volume': int(quote.get('volume', 0)),
-                    'change': float(quote.get('change', 0))
-                }
-            
-            return result
-        else:
-            logger.error(f"Failed to get market quotes: {response}")
-            return {}
+        logger.info(f"✅ Fetched data for {len(result)} options")
+        return result
             
     except Exception as e:
         logger.exception(f"❌ Error fetching option data: {e}")
