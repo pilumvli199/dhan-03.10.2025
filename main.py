@@ -58,6 +58,15 @@ def tele_send_http(chat_id: str, text: str):
 
 # ---------------- Dhan client creation ----------------
 def make_dhan():
+    """
+    Robust client factory that handles multiple dhanhq package shapes.
+    Tries common patterns:
+      - dhanhq.dhanhq(client_id, access_token)
+      - dhanhq.DhanContext(...) + dhanhq.dhanhq(ctx)
+      - dhanhq.Client(...) variants
+      - dhanhq.dhanhq({"client_id":..., "access_token":...})
+    Raises RuntimeError with helpful info if it can't create a client.
+    """
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
         raise RuntimeError("Missing DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN")
 
@@ -66,7 +75,7 @@ def make_dhan():
 
     errors = []
 
-    # Try patterns similar to earlier patch
+    # 1) direct factory: dhanhq.dhanhq(client_id, access_token)
     try:
         if hasattr(dhanhq, "dhanhq") and callable(getattr(dhanhq, "dhanhq")):
             try:
@@ -80,6 +89,7 @@ def make_dhan():
     except Exception as e:
         errors.append(("check dhanhq.dhanhq existence", str(e)))
 
+    # 2) DhanContext style: dhanhq.DhanContext(...) then dhanhq.dhanhq(ctx)
     try:
         if hasattr(dhanhq, "DhanContext") and callable(getattr(dhanhq, "DhanContext")):
             try:
@@ -98,22 +108,24 @@ def make_dhan():
     except Exception as e:
         errors.append(("check DhanContext existence", str(e)))
 
+    # 3) Client class patterns
     try:
         if hasattr(dhanhq, "Client") and callable(getattr(dhanhq, "Client")):
             try:
                 try:
                     c = dhanhq.Client(client_id=DHAN_CLIENT_ID, access_token=DHAN_ACCESS_TOKEN)
-                    logger.debug("Created dhan client via dhanhq.Client(keyword)")
+                    logger.debug("Created dhan client via dhanhq.Client(client_id=..., access_token=...)")
                     return c
                 except TypeError:
                     c = dhanhq.Client(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-                    logger.debug("Created dhan client via dhanhq.Client(positional)")
+                    logger.debug("Created dhan client via dhanhq.Client(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)")
                     return c
             except Exception as e:
                 errors.append(("Client(...) creation", str(e)))
     except Exception as e:
         errors.append(("check Client existence", str(e)))
 
+    # 4) try dict-style factory
     try:
         if hasattr(dhanhq, "dhanhq") and callable(getattr(dhanhq, "dhanhq")):
             try:
@@ -125,6 +137,7 @@ def make_dhan():
     except Exception as e:
         errors.append(("check dhanhq for dict-style", str(e)))
 
+    # 5) last attempt: try any 'create' classmethod exposed
     try:
         for name in ("create","connect","from_credentials"):
             if hasattr(dhanhq, name) and callable(getattr(dhanhq, name)):
@@ -138,12 +151,14 @@ def make_dhan():
     except Exception as e:
         errors.append(("create-like attempts", str(e)))
 
+    # If none succeeded, raise informative error
     available = ", ".join(sorted(n for n in dir(dhanhq) if not n.startswith("_")))
     err_text = f"Could not construct dhanhq client. Available attrs: {available}. Attempts/errors: {errors}"
     raise RuntimeError(err_text)
 
 # ---------------- expiry helpers ----------------
 def weekly_expiry_for_index(index_name):
+    # NIFTY weekly expiry = Thursday (weekday 3), BANKNIFTY weekly expiry = Wednesday (weekday 2)
     today = datetime.now().date()
     if index_name == "NIFTY":
         target = 3
@@ -157,6 +172,11 @@ def weekly_expiry_for_index(index_name):
 
 # ---------------- robust calls to SDK and REST fallback ----------------
 def try_quote_data(dhan, exchange_key, underlying_id):
+    """
+    Try calling dhan.quote_data correctly.
+    Preferred payload: {'securities': {'IDX_I': [13]}}
+    Returns parsed response or None.
+    """
     payload = {"securities": {exchange_key: [int(underlying_id)]}}
     try:
         resp = None
@@ -177,6 +197,7 @@ def try_quote_data(dhan, exchange_key, underlying_id):
         return None
 
 def rest_option_chain(underlying_id, exchange_key, expiry):
+    """Fallback REST call to Dhan option-chain endpoint (uses client-id + access-token headers)."""
     try:
         url = "https://api.dhan.co/v2/option-chain"
         headers = {
@@ -196,6 +217,10 @@ def rest_option_chain(underlying_id, exchange_key, expiry):
         return None
 
 def try_option_chain_sdk(dhan, underlying_id, expiry, exchange_key):
+    """
+    Try various argument styles for dhan.option_chain.
+    Return response dict or None.
+    """
     tries = []
     candidates = [
         {"under_security_id": int(underlying_id), "under_exchange_segment": exchange_key, "expiry": expiry},
@@ -229,11 +254,15 @@ def safe_get_ltp_from_quote_response(resp):
     try:
         if not resp:
             return None
+        # resp may be dict with 'data'
         if isinstance(resp, dict):
             data = resp.get("data", resp.get("Data", resp))
+            # if data is dict containing exchange key
             if isinstance(data, dict):
+                # try to find first numeric last price
                 for v in data.values():
                     if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+                        # find LTP in v[0]
                         item = v[0]
                         for k in ("LTP","ltp","lastPrice","last_price","last"):
                             if k in item and item[k] not in (None, ""):
@@ -241,6 +270,7 @@ def safe_get_ltp_from_quote_response(resp):
                                     return float(item[k])
                                 except:
                                     pass
+                # direct fields
                 for k in ("LTP","ltp","lastPrice","last_price","last"):
                     if k in data and data[k] not in (None, ""):
                         try:
@@ -255,6 +285,7 @@ def safe_get_ltp_from_quote_response(resp):
                             return float(item[k])
                         except:
                             pass
+        # fallback search numbers
         s = str(resp)
         import re
         m = re.search(r'ltp[^\d]*([\d]+\.[\d]+|[\d]+)', s, re.IGNORECASE)
@@ -267,82 +298,80 @@ def safe_get_ltp_from_quote_response(resp):
 
 def extract_spot_from_chain(raw):
     """
-    Attempt many common keys/nesting to find underlying spot price.
-    Returns (spot: float or None, preview_str: str)
+    Robust extraction of underlying spot price from many possible shapes.
+    - Recursively searches dict/list for keys that hint at underlying/spot/ltp/last.
+    - If finds numeric-like string/value, returns that.
+    - If none found, scans for strikes and returns median strike (inferred).
+    Returns (spot: float or None, preview_str: str, inferred: bool)
     """
     try:
         preview = ""
         if not raw:
-            return None, preview
-        # for logging small preview
+            return None, preview, False
+        # small preview for logs
         try:
-            preview = json.dumps(raw)[:1000]
+            preview = json.dumps(raw)[:1200]
         except Exception:
-            preview = str(raw)[:1000]
+            preview = str(raw)[:1200]
 
-        # normalize
-        data = raw.get("data") if isinstance(raw, dict) and "data" in raw else raw
-
-        # candidate keys at top-level of data
-        keys_to_try = [
-            "UnderlyingLast","UnderlyingLastPrice","underlying","underlying_price","underlyingLTP",
-            "spot","Spot","ltp","lastPrice","last_price","Last"
-        ]
-
-        # direct checks
-        if isinstance(data, dict):
-            for k in keys_to_try:
-                if k in data and data[k] not in (None, ""):
-                    try:
-                        return float(data[k]), preview
-                    except:
-                        pass
-
-        # some responses nest underlying under 'meta','snapshot','underlyingInstrument','underlyingData'
-        nested_paths = [
-            ["meta","underlying","lastPrice"],
-            ["meta","underlying","spot"],
-            ["snapshot","underlying","lastPrice"],
-            ["underlyingInstrument","lastPrice"],
-            ["underlyingData","last"],
-            ["records","underlying","lastPrice"],
-            ["data","underlying","lastPrice"],
-        ]
-        def get_in(d, path):
-            cur = d
-            for p in path:
-                if not isinstance(cur, dict):
+        # helper: try convert to float
+        def to_num(v):
+            try:
+                if v is None: return None
+                if isinstance(v, (int, float)):
+                    return float(v)
+                s = str(v).strip().replace(',', '')
+                if s == "":
                     return None
-                if p in cur:
-                    cur = cur[p]
-                else:
+                # if purely non-numeric, ignore
+                # allow negative and decimal
+                # remove plus signs
+                if any(c.isalpha() for c in s) and not any(ch.isdigit() for ch in s):
                     return None
-            return cur
+                return float(s)
+            except:
+                return None
 
-        if isinstance(data, dict):
-            for p in nested_paths:
-                val = get_in(data, p)
-                if val not in (None, ""):
-                    try:
-                        return float(val), preview
-                    except:
-                        pass
+        # keys that strongly indicate underlying price
+        key_patterns = ("underlying","underlyinglast","underlyinglastprice",
+                        "underlying_price","underlyingltp","spot","ltp","lastprice","last_price","last")
 
-        # sometimes data is a list of option rows and there is a separate field 'underlying' at top-level raw
-        if isinstance(raw, dict):
-            for k in ("UnderlyingLast","UnderlyingLastPrice","underlying","spot","ltp"):
-                if k in raw and raw[k] not in (None, ""):
-                    try:
-                        return float(raw[k]), preview
-                    except:
-                        pass
+        # recursive search
+        found_values = []
+        def recurse(obj, path=""):
+            if obj is None:
+                return
+            if isinstance(obj, dict):
+                for k,v in obj.items():
+                    key_low = str(k).lower()
+                    num = None
+                    for pat in key_patterns:
+                        if pat in key_low:
+                            num = to_num(v)
+                            if num is not None:
+                                found_values.append((num, path + "/" + str(k)))
+                                return  # prefer first strong hit
+                    recurse(v, path + "/" + str(k))
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj[:200]):  # limit length
+                    recurse(item, f"{path}[{i}]")
+            else:
+                num = to_num(obj)
+                if num is not None:
+                    found_values.append((num, path))
 
-        # as last resort: if data contains option rows, derive median strike as inferred spot
+        recurse(raw)
+
+        if found_values:
+            num, where = found_values[0]
+            return float(num), preview, False
+
+        # if nothing direct found, try to infer from strikes present in option rows
         strikes = []
+        data = raw.get("data") if isinstance(raw, dict) and "data" in raw else raw
         target = data
-        # if data has keys like 'options' or 'optionChain' where actual rows live
         if isinstance(data, dict):
-            for k in ("options","optionChain","records","rows","data","optionsList"):
+            for k in ("options","optionchain","records","rows","data","optionslist"):
                 if k in data and isinstance(data[k], list):
                     target = data[k]
                     break
@@ -350,42 +379,49 @@ def extract_spot_from_chain(raw):
             for item in target:
                 if not isinstance(item, dict):
                     continue
-                for k in ("strike","StrikePrice","strikePrice","SEM_STRIKE_PRICE"):
+                for k in ("strike","strikeprice","strike_price","sem_strike_price","StrikePrice"):
                     if k in item:
                         try:
-                            strikes.append(int(float(item[k])))
+                            s = int(float(item[k])); strikes.append(s)
                         except:
                             pass
-                # sometimes strike inside CE/PE
-                if not strikes and 'CE' in item and isinstance(item['CE'], dict):
-                    for kk in ('strike','StrikePrice'):
-                        if kk in item['CE']:
-                            try:
-                                strikes.append(int(float(item['CE'][kk]))); break
-                            except:
-                                pass
+                # try inside CE/PE blocks
+                for side in ("CE","PE","call","put"):
+                    if side in item and isinstance(item[side], dict):
+                        for kk in ("strike","StrikePrice"):
+                            if kk in item[side]:
+                                try:
+                                    s = int(float(item[side][kk])); strikes.append(s)
+                                except:
+                                    pass
         if strikes:
             strikes_sorted = sorted(set(strikes))
             mid = strikes_sorted[len(strikes_sorted)//2]
-            return float(mid), preview
+            return float(mid), preview, True
 
-        # nothing found
-        return None, preview
+        return None, preview, False
+
     except Exception as e:
-        logger.debug("extract_spot_from_chain fail: %s", e)
-        return None, ""
+        logger.exception("extract_spot_from_chain fail: %s", e)
+        return None, "", False
 
 def choose_strikes_around_atm(atm, gap, total=10):
     half = total // 2
+    # if total is even, we'll take half below and half above (e.g. 10 -> -5..+4)
     offsets = list(range(-half, half))
     strikes = sorted([int(atm + i*gap) for i in offsets])
     return strikes
 
 def parse_option_chain_raw(raw):
+    """
+    Convert raw option-chain response to a list/dict of rows with keys:
+    strike (int), CE, PE with ltp/oi/volume
+    """
     rows = []
     if not raw:
         return rows
     data = raw.get("data") if isinstance(raw, dict) and "data" in raw else raw
+    # Common shapes: data might include 'options' list or list of rows
     if isinstance(data, dict):
         for k in ("options","optionChain","records","rows","data","optionsList"):
             if k in data and isinstance(data[k], list):
@@ -410,23 +446,30 @@ def parse_option_chain_raw(raw):
                         strike = None
             if strike is None:
                 continue
+
             ce = item.get('CE') or item.get('call') or None
             pe = item.get('PE') or item.get('put') or None
+
             def ext(o):
                 if not o or not isinstance(o, dict):
                     return {'ltp':0.0,'oi':0,'volume':0}
-                l = 0.0; oi = 0; vol = 0
+                l = 0.0
+                oi = 0
+                vol = 0
                 for k in ('LTP','ltp','lastPrice','last_price'):
                     if k in o and o[k] not in (None,''):
-                        try: l = float(o[k]); break
+                        try:
+                            l = float(o[k]); break
                         except: pass
                 for k in ('openInterest','OI','open_interest'):
                     if k in o and o[k] not in (None,''):
-                        try: oi = int(float(o[k])); break
+                        try:
+                            oi = int(float(o[k])); break
                         except: pass
                 for k in ('volume','Volume'):
                     if k in o and o[k] not in (None,''):
-                        try: vol = int(float(o[k])); break
+                        try:
+                            vol = int(float(o[k])); break
                         except: pass
                 return {'ltp':l,'oi':oi,'volume':vol}
             rows.append({'strike':strike,'CE':ext(ce),'PE':ext(pe)})
@@ -459,6 +502,7 @@ def parse_option_chain_raw(raw):
 
 # ---------------- formatting message ----------------
 def format_for_telegram(index_name, spot, expiry, strikes, strike_rows, spot_inferred=False):
+    # strike_rows: list of {'strike':int,'CE':{..},'PE':{..}}
     m = {r['strike']: {'CE': r.get('CE',{}), 'PE': r.get('PE',{})} for r in strike_rows}
     lines = []
     inferred_note = " (inferred)" if spot_inferred else ""
@@ -514,6 +558,7 @@ def bot_loop():
         iteration += 1
         logger.info("=== Iteration #%d ===", iteration)
         try:
+            # prepare expiries
             nifty_expiry = NIFTY_EXPIRY or weekly_expiry_for_index("NIFTY")
             bank_expiry = BANKNIFTY_EXPIRY or weekly_expiry_for_index("BANKNIFTY")
 
@@ -531,38 +576,36 @@ def bot_loop():
             if spot_n is None:
                 raw_chain_n = try_option_chain_sdk(dhan, NIFTY_ID, nifty_expiry, IDX_KEY)
                 if raw_chain_n:
-                    s, preview = extract_spot_from_chain(raw_chain_n)
-                    logger.debug("NIFTY raw_chain preview: %s", preview)
+                    s, preview, inferred = extract_spot_from_chain(raw_chain_n)
+                    logger.info("NIFTY raw_chain preview (first 1200 chars): %s", preview)
                     if s is not None:
                         spot_n = s
-                        # determine if inferred (median strike) or true underlying field: check preview presence of keys
-                        # If preview contains 'Underlying' keys, treat as direct (not inferred)
-                        if 'Underlying' in preview or 'underlying' in preview or 'UnderlyingLast' in preview:
-                            spot_n_inferred = False
-                        else:
-                            # if we extracted from median strike path then we inferred
-                            # crude heuristic: if preview contains many strikes but not underlying keys, mark inferred
-                            if 'strike' in preview or 'StrikePrice' in preview:
-                                spot_n_inferred = True
-                # fallback REST if needed
+                        spot_n_inferred = bool(inferred)
+
+                # if still none, fallback REST option-chain (which in many examples returns option + underlying)
                 if spot_n is None and raw_chain_n is None:
                     raw_chain_n = rest_option_chain(NIFTY_ID, IDX_KEY, nifty_expiry)
                     if raw_chain_n:
-                        s, preview = extract_spot_from_chain(raw_chain_n)
-                        logger.debug("NIFTY REST raw_chain preview: %s", preview)
+                        s, preview, inferred = extract_spot_from_chain(raw_chain_n)
+                        logger.info("NIFTY REST raw_chain preview (first 1200 chars): %s", preview)
                         if s is not None:
                             spot_n = s
-                            spot_n_inferred = True
+                            spot_n_inferred = bool(inferred)
 
+            # if still no raw_chain_n, try SDK again
             if raw_chain_n is None:
                 raw_chain_n = try_option_chain_sdk(dhan, NIFTY_ID, nifty_expiry, IDX_KEY) or rest_option_chain(NIFTY_ID, IDX_KEY, nifty_expiry)
 
+            # if we have spot and chain, parse & send
             if raw_chain_n and spot_n is not None:
+                # choose ATM and strikes
                 gap = 50
                 atm = round(spot_n / gap) * gap
                 strikes = choose_strikes_around_atm(atm, gap, total=STRIKE_COUNT)
                 parsed_rows = parse_option_chain_raw(raw_chain_n)
+                # filter parsed_rows for required strikes
                 filtered = [r for r in parsed_rows if r['strike'] in strikes]
+                # fill missing strikes with empty template
                 for s in strikes:
                     if not any(r['strike']==s for r in filtered):
                         filtered.append({'strike':s,'CE':{'ltp':0.0,'oi':0,'volume':0},'PE':{'ltp':0.0,'oi':0,'volume':0}})
@@ -573,7 +616,7 @@ def bot_loop():
                 logger.warning("Could not fetch complete NIFTY data (spot:%s, chain:%s)", bool(spot_n), bool(raw_chain_n))
                 tele_send_http(TELE_CHAT_ID, f"⚠️ NIFTY fetch incomplete. spot={spot_n is not None}, chain={raw_chain_n is not None}")
 
-            time.sleep(1)
+            time.sleep(1)  # small gap
 
             # --- BANKNIFTY ---
             spot_b = None
@@ -589,23 +632,20 @@ def bot_loop():
             if spot_b is None:
                 raw_chain_b = try_option_chain_sdk(dhan, BANKNIFTY_ID, bank_expiry, IDX_KEY)
                 if raw_chain_b:
-                    s, preview = extract_spot_from_chain(raw_chain_b)
-                    logger.debug("BANKNIFTY raw_chain preview: %s", preview)
+                    s, preview, inferred = extract_spot_from_chain(raw_chain_b)
+                    logger.info("BANKNIFTY raw_chain preview (first 1200 chars): %s", preview)
                     if s is not None:
                         spot_b = s
-                        if 'Underlying' in preview or 'underlying' in preview or 'UnderlyingLast' in preview:
-                            spot_b_inferred = False
-                        else:
-                            if 'strike' in preview or 'StrikePrice' in preview:
-                                spot_b_inferred = True
+                        spot_b_inferred = bool(inferred)
+
                 if spot_b is None and raw_chain_b is None:
                     raw_chain_b = rest_option_chain(BANKNIFTY_ID, IDX_KEY, bank_expiry)
                     if raw_chain_b:
-                        s, preview = extract_spot_from_chain(raw_chain_b)
-                        logger.debug("BANKNIFTY REST raw_chain preview: %s", preview)
+                        s, preview, inferred = extract_spot_from_chain(raw_chain_b)
+                        logger.info("BANKNIFTY REST raw_chain preview (first 1200 chars): %s", preview)
                         if s is not None:
                             spot_b = s
-                            spot_b_inferred = True
+                            spot_b_inferred = bool(inferred)
 
             if raw_chain_b is None:
                 raw_chain_b = try_option_chain_sdk(dhan, BANKNIFTY_ID, bank_expiry, IDX_KEY) or rest_option_chain(BANKNIFTY_ID, IDX_KEY, bank_expiry)
