@@ -8,8 +8,12 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify
 import requests
 
-# Dhan SDK import (assuming dhanhq installed)
-from dhanhq import dhanhq, DhanContext  # try both styles
+# Import module only — don't import non-existent symbols at top-level.
+# We'll inspect and call the right constructor inside make_dhan().
+try:
+    import dhanhq
+except Exception:
+    dhanhq = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('dhanhq-option-chain-bot')
@@ -54,15 +58,106 @@ def tele_send_http(chat_id: str, text: str):
 
 # ---------------- Dhan client creation ----------------
 def make_dhan():
+    """
+    Robust client factory that handles multiple dhanhq package shapes.
+    Tries common patterns:
+      - dhanhq.dhanhq(client_id, access_token)
+      - dhanhq.DhanContext(...) + dhanhq.dhanhq(ctx)
+      - dhanhq.Client(...) variants
+      - dhanhq.dhanhq({"client_id":..., "access_token":...})
+    Raises RuntimeError with helpful info if it can't create a client.
+    """
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
         raise RuntimeError("Missing DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN")
+
+    if dhanhq is None:
+        raise RuntimeError("dhanhq package not importable in current environment")
+
+    errors = []
+
+    # 1) direct factory: dhanhq.dhanhq(client_id, access_token)
     try:
-        # try context style
-        ctx = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-        return dhanhq(ctx)
-    except Exception:
-        # fallback to older signature
-        return dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+        if hasattr(dhanhq, "dhanhq") and callable(getattr(dhanhq, "dhanhq")):
+            try:
+                c = dhanhq.dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+                logger.debug("Created dhan client via dhanhq.dhanhq(client_id, access_token)")
+                return c
+            except TypeError as te:
+                errors.append(("dhanhq(... two args)", str(te)))
+            except Exception as e:
+                errors.append(("dhanhq(... two args) other", str(e)))
+    except Exception as e:
+        errors.append(("check dhanhq.dhanhq existence", str(e)))
+
+    # 2) DhanContext style: dhanhq.DhanContext(...) then dhanhq.dhanhq(ctx)
+    try:
+        if hasattr(dhanhq, "DhanContext") and callable(getattr(dhanhq, "DhanContext")):
+            try:
+                ctx = dhanhq.DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+                if hasattr(dhanhq, "dhanhq") and callable(getattr(dhanhq, "dhanhq")):
+                    try:
+                        c = dhanhq.dhanhq(ctx)
+                        logger.debug("Created dhan client via DhanContext + dhanhq.dhanhq(ctx)")
+                        return c
+                    except Exception as e:
+                        errors.append(("dhanhq(ctx) after DhanContext", str(e)))
+                else:
+                    # maybe the context itself is the client
+                    logger.debug("DhanContext exists; returning context instance as client")
+                    return ctx
+            except Exception as e:
+                errors.append(("DhanContext(...) creation", str(e)))
+    except Exception as e:
+        errors.append(("check DhanContext existence", str(e)))
+
+    # 3) Client class patterns
+    try:
+        if hasattr(dhanhq, "Client") and callable(getattr(dhanhq, "Client")):
+            try:
+                # try keyword-style
+                try:
+                    c = dhanhq.Client(client_id=DHAN_CLIENT_ID, access_token=DHAN_ACCESS_TOKEN)
+                    logger.debug("Created dhan client via dhanhq.Client(client_id=..., access_token=...)")
+                    return c
+                except TypeError:
+                    c = dhanhq.Client(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+                    logger.debug("Created dhan client via dhanhq.Client(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)")
+                    return c
+            except Exception as e:
+                errors.append(("Client(...) creation", str(e)))
+    except Exception as e:
+        errors.append(("check Client existence", str(e)))
+
+    # 4) try dict-style factory
+    try:
+        if hasattr(dhanhq, "dhanhq") and callable(getattr(dhanhq, "dhanhq")):
+            try:
+                c = dhanhq.dhanhq({"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN})
+                logger.debug("Created dhan client via dhanhq.dhanhq(dict)")
+                return c
+            except Exception as e:
+                errors.append(("dhanhq(dict)", str(e)))
+    except Exception as e:
+        errors.append(("check dhanhq for dict-style", str(e)))
+
+    # 5) last attempt: try any 'create' classmethod exposed
+    try:
+        for name in ("create","connect","from_credentials"):
+            if hasattr(dhanhq, name) and callable(getattr(dhanhq, name)):
+                try:
+                    fn = getattr(dhanhq, name)
+                    c = fn(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+                    logger.debug("Created dhan client via dhanhq.%s()", name)
+                    return c
+                except Exception as e:
+                    errors.append((f"{name}(id,token)", str(e)))
+    except Exception as e:
+        errors.append(("create-like attempts", str(e)))
+
+    # If none succeeded, raise informative error
+    available = ", ".join(sorted(n for n in dir(dhanhq) if not n.startswith("_")))
+    err_text = f"Could not construct dhanhq client. Available attrs: {available}. Attempts/errors: {errors}"
+    raise RuntimeError(err_text)
 
 # ---------------- expiry helpers ----------------
 def weekly_expiry_for_index(index_name):
@@ -329,7 +424,23 @@ def format_for_telegram(index_name, spot, expiry, strikes, strike_rows):
     for s in sorted(strikes):
         d = m.get(s, {'CE':{'ltp':0,'oi':0}, 'PE':{'ltp':0,'oi':0}})
         ce = d['CE']; pe = d['PE']
-        lines.append(f"<code>{ce['ltp']:8.1f} {ce['oi']:8d} {int(s):10d} {pe['ltp']:8.1f} {pe['oi']:8d}</code>")
+        try:
+            ce_ltp = float(ce.get('ltp', 0.0))
+        except:
+            ce_ltp = 0.0
+        try:
+            pe_ltp = float(pe.get('ltp', 0.0))
+        except:
+            pe_ltp = 0.0
+        try:
+            ce_oi = int(ce.get('oi', 0))
+        except:
+            ce_oi = 0
+        try:
+            pe_oi = int(pe.get('oi', 0))
+        except:
+            pe_oi = 0
+        lines.append(f"<code>{ce_ltp:8.1f} {ce_oi:8d} {int(s):10d} {pe_ltp:8.1f} {pe_oi:8d}</code>")
     lines.append("─"*60)
     lines.append(f"🕐 {time.strftime('%Y-%m-%d %H:%M:%S')}")
     return "\n".join(lines)
@@ -343,8 +454,12 @@ def bot_loop():
     try:
         dhan = make_dhan()
         logger.info("✅ Dhan client initialized")
-        # debug list of methods
-        logger.debug("dhan methods: %s", [m for m in dir(dhan) if callable(getattr(dhan,m))][:80])
+        logger.info("Dhan client type: %s", type(dhan))
+        # debug list of methods (trimmed)
+        try:
+            logger.debug("dhan methods: %s", [m for m in dir(dhan) if callable(getattr(dhan,m))][:80])
+        except Exception:
+            pass
         tele_send_http(TELE_CHAT_ID, "✅ DhanHQ Option Chain Bot started!")
     except Exception as e:
         logger.exception("Dhan init failed: %s", e)
@@ -376,10 +491,8 @@ def bot_loop():
                 if raw_chain_n:
                     # try to find underlying LTP inside raw_chain_n
                     try:
-                        # some responses include data['underlying'] or data['spot']
                         data = raw_chain_n.get('data') if isinstance(raw_chain_n, dict) else raw_chain_n
-                        # try typical fields
-                        for key in ('underlying','underlying_price','underlyingLTP','spot'):
+                        for key in ('underlying','underlying_price','underlyingLTP','spot','UnderlyingLast','UnderlyingLastPrice'):
                             val = None
                             if isinstance(data, dict):
                                 val = data.get(key) if key in data else None
@@ -394,7 +507,6 @@ def bot_loop():
                 if spot_n is None and raw_chain_n is None:
                     raw_chain_n = rest_option_chain(NIFTY_ID, IDX_KEY, nifty_expiry)
                     if raw_chain_n:
-                        # sometimes REST returns data.underlying or Data.Underlying
                         try:
                             dd = raw_chain_n.get('data', raw_chain_n)
                             if isinstance(dd, dict):
