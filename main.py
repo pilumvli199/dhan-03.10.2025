@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify
 import requests
 
+# try import SDK
 try:
     import dhanhq
 except Exception:
@@ -21,23 +22,28 @@ DHAN_CLIENT_ID = os.getenv('DHAN_CLIENT_ID')
 DHAN_ACCESS_TOKEN = os.getenv('DHAN_ACCESS_TOKEN')
 TELE_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELE_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
 POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)
 STRIKE_COUNT = int(os.getenv('STRIKE_COUNT') or 10)
 NIFTY_ID = int(os.getenv('NIFTY_ID') or 13)
 BANKNIFTY_ID = int(os.getenv('BANKNIFTY_ID') or 25)
 IDX_KEY = os.getenv('IDX_KEY') or "IDX_I"
+
 NIFTY_EXPIRY = os.getenv('NIFTY_EXPIRY') or ""
 BANKNIFTY_EXPIRY = os.getenv('BANKNIFTY_EXPIRY') or ""
 
-# Backoff/cooldown (seconds) after REST rate-limit or 404 failures
-REST_COOLDOWN_SECONDS = int(os.getenv('REST_COOLDOWN_SECONDS') or 30)
+# control REST behaviour
+DISABLE_REST = os.getenv('DISABLE_REST', "false").lower() in ("1","true","yes")
+# initial cooldown (seconds) after REST failure; exponential backoff will multiply it
+REST_COOLDOWN_BASE = int(os.getenv('REST_COOLDOWN_BASE') or 300)  # default 5 minutes
+REST_COOLDOWN_MAX = int(os.getenv('REST_COOLDOWN_MAX') or 3600)   # cap 1 hour
 
 REQUIRED = [DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELE_TOKEN, TELE_CHAT_ID]
 
 app = Flask(__name__)
 
-# track last rest failure time per underlying to avoid hammering REST
-_last_rest_failure = {}
+# track cooldown state per underlying (keyed by "IDX_I:13")
+_rest_state = {}  # key -> {"cooldown_until": ts, "backoff": n}
 
 def tele_send_http(chat_id: str, text: str):
     try:
@@ -62,7 +68,7 @@ def make_dhan():
         raise RuntimeError("Missing DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN")
     if dhanhq is None:
         raise RuntimeError("dhanhq package not importable in current environment")
-    # try common constructors
+    # Try common constructors
     try:
         if hasattr(dhanhq, "dhanhq") and callable(getattr(dhanhq, "dhanhq")):
             try:
@@ -85,39 +91,28 @@ def make_dhan():
                     return dhanhq.Client(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
                 except:
                     pass
-        # dict style
-        try:
-            return dhanhq.dhanhq({"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN})
-        except:
-            pass
-    except Exception as e:
-        logger.exception("make_dhan attempts failed: %s", e)
+    except Exception:
+        pass
     raise RuntimeError("Could not construct dhanhq client with available module shape.")
 
 # ---------------- expiry helpers ----------------
 def weekly_expiry_for_index(index_name):
-    """Return next weekly expiry date (as date object)."""
     today = datetime.now().date()
     if index_name == "NIFTY":
-        target = 3  # Thursday
+        target = 3
     else:
-        target = 2  # Wednesday
+        target = 2
     days_ahead = (target - today.weekday()) % 7
     if days_ahead == 0:
         days_ahead = 7
     return today + timedelta(days=days_ahead)
 
 def expiry_variants(date_obj):
-    """
-    Given a date object, return a list of expiry string variants to try.
-    Order: ISO YYYY-MM-DD, DD-MMM-YYYY (07-Oct-2025), YYYYMMDD
-    """
     iso = date_obj.strftime("%Y-%m-%d")
-    ddmmmy = date_obj.strftime("%d-%b-%Y")  # e.g. 07-Oct-2025
-    ymd_compact = date_obj.strftime("%Y%m%d")
-    # also plain DD-MM-YYYY
+    ddmmmy = date_obj.strftime("%d-%b-%Y")
+    ymdc = date_obj.strftime("%Y%m%d")
     ddmmy = date_obj.strftime("%d-%m-%Y")
-    return [iso, ddmmmy, ymd_compact, ddmmy]
+    return [iso, ddmmmy, ymdc, ddmmy]
 
 # ---------------- SDK/REST helpers ----------------
 def try_quote_data(dhan, exchange_key, underlying_id):
@@ -136,21 +131,38 @@ def try_quote_data(dhan, exchange_key, underlying_id):
         logger.debug("try_quote_data fatal: %s", e)
         return None
 
-def _rest_allowed(underlying_key):
-    """Check cooldown for REST for this underlying."""
-    t = _last_rest_failure.get(underlying_key)
-    if not t:
-        return True
-    return (time.time() - t) > REST_COOLDOWN_SECONDS
-
-def rest_option_chain(underlying_id, exchange_key, expiry):
-    """
-    Try REST option-chain for multiple expiry formats; handle rate-limit/404 gracefully.
-    Returns parsed JSON or None.
-    """
+def _rest_allowed(exchange_key, underlying_id):
+    if DISABLE_REST:
+        return False
     key = f"{exchange_key}:{underlying_id}"
-    if not _rest_allowed(key):
-        logger.info("Skipping REST option-chain for %s due to cooldown", key)
+    st = _rest_state.get(key)
+    if not st:
+        return True
+    return time.time() > st.get("cooldown_until", 0)
+
+def _update_rest_failure(exchange_key, underlying_id):
+    key = f"{exchange_key}:{underlying_id}"
+    st = _rest_state.get(key, {"backoff": 0})
+    st["backoff"] = min(st.get("backoff", 0) + 1, 10)
+    # exponential backoff: base * 2^(backoff-1)
+    delay = REST_COOLDOWN_BASE * (2 ** (st["backoff"] - 1)) if st["backoff"] > 0 else REST_COOLDOWN_BASE
+    delay = min(delay, REST_COOLDOWN_MAX)
+    st["cooldown_until"] = time.time() + delay
+    _rest_state[key] = st
+    logger.warning("REST cooldown set for %s (backoff=%s, cooldown_seconds=%s)", key, st["backoff"], int(delay))
+
+def _clear_rest_failure(exchange_key, underlying_id):
+    key = f"{exchange_key}:{underlying_id}"
+    if key in _rest_state:
+        del _rest_state[key]
+
+def rest_option_chain(underlying_id, exchange_key, expiry_date):
+    """
+    Try REST option-chain for multiple expiry formats; implement cooldown/backoff on failures.
+    Returns JSON or None.
+    """
+    if not _rest_allowed(exchange_key, underlying_id):
+        logger.info("REST not allowed now for %s:%s due to cooldown", exchange_key, underlying_id)
         return None
     url = "https://api.dhan.co/v2/option-chain"
     headers = {
@@ -158,89 +170,91 @@ def rest_option_chain(underlying_id, exchange_key, expiry):
         "client-id": DHAN_CLIENT_ID,
         "Content-Type": "application/json"
     }
-    # Try expiry variants
-    for exp in expiry_variants(expiry):
+    for exp in expiry_variants(expiry_date):
         payload = {"UnderlyingScrip": int(underlying_id), "UnderlyingSeg": exchange_key, "Expiry": exp}
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=15)
+            r = requests.post(url, headers=headers, json=payload, timeout=12)
         except Exception as e:
-            logger.debug("REST option-chain request error for expiry %s: %s", exp, e)
+            logger.debug("REST request error for expiry %s: %s", exp, e)
+            _update_rest_failure(exchange_key, underlying_id)
             continue
         if r.status_code == 200:
             try:
                 j = r.json()
             except Exception:
-                logger.warning("REST option-chain returned non-json for expiry %s", exp)
-                return None
-            # Check for explicit failure wrapper
+                logger.warning("REST returned non-json for expiry %s", exp)
+                _update_rest_failure(exchange_key, underlying_id)
+                continue
+            # handle failure wrapper from API
             if isinstance(j, dict) and j.get("status") and str(j.get("status")).lower() == "failure":
-                logger.info("REST option-chain returned failure for expiry %s: %s", exp, (j.get("data") or j.get("remarks") or j))
-                # don't treat as hard block unless code indicates too many requests
-                # if error message looks like rate-limit -> set cooldown
+                logger.info("REST response failure for expiry %s: %s", exp, (j.get("data") or j.get("remarks") or j))
+                # if message contains rate-limit / blocked -> set failure
                 err_text = json.dumps(j.get("data") or j)
                 if "Too many requests" in err_text or "blocked" in err_text or "Too many" in err_text:
-                    logger.warning("REST rate-limit detected; setting cooldown for key %s", key)
-                    _last_rest_failure[key] = time.time()
+                    _update_rest_failure(exchange_key, underlying_id)
+                else:
+                    # treat as unusable response but not necessarily rate-limit
+                    _update_rest_failure(exchange_key, underlying_id)
                 continue
+            # successful usable response; clear any failure state
+            _clear_rest_failure(exchange_key, underlying_id)
             return j
         else:
-            # 404/429/other
             text = r.text or ""
             logger.warning("REST option-chain returned %s: %s", r.status_code, text[:300])
             if r.status_code in (429, 503) or "Too many" in text or "blocked" in text:
-                logger.warning("REST rate-limit or service unavailable for %s; setting cooldown", key)
-                _last_rest_failure[key] = time.time()
+                _update_rest_failure(exchange_key, underlying_id)
                 return None
-            # if 404 maybe endpoint/params wrong - try next expiry or bail
             if r.status_code == 404:
-                # try next expiry format (loop continues)
+                # endpoint might be invalid — set cooldown longer
+                logger.warning("REST 404 for %s expiry %s; backing off.", exchange_key, exp)
+                _update_rest_failure(exchange_key, underlying_id)
+                # try next expiry variant but likely all will 404 -> will go to cooldown
                 continue
-    # all variants tried -> mark failure for a short cooldown to avoid hammering
-    _last_rest_failure[key] = time.time()
+            # other codes -> backoff a bit and continue
+            _update_rest_failure(exchange_key, underlying_id)
+            continue
+    # tried all variants -> set cooldown
+    _update_rest_failure(exchange_key, underlying_id)
     return None
 
-def try_option_chain_sdk(dhan, underlying_id, expiry, exchange_key):
+def try_option_chain_sdk(dhan, underlying_id, expiry_date, exchange_key):
     """
-    Try various argument styles for dhan.option_chain and expiry formats.
-    Return response dict or None.
+    Try various argument shapes and expiry variants for SDK option_chain.
+    Returns dict or None.
     """
-    candidates_base = [
+    expiry_vals = expiry_variants(expiry_date)
+    bases = [
         {"under_security_id": int(underlying_id), "under_exchange_segment": exchange_key},
         {"underlying_security_id": int(underlying_id), "under_exchange_segment": exchange_key},
         {"UNDERLYING": int(underlying_id)},
         {"instrument": int(underlying_id), "segment": exchange_key},
     ]
-    # For each candidate add expiry fields in common names using expiry variants
-    expiry_vals = expiry_variants(expiry)
-    tried = []
-    for base in candidates_base:
-        for exp_val in expiry_vals:
-            # try different expiry param names per earlier observed variants
-            for exp_key in ("expiry","Expiry","ExpiryDate","Expiry_Date"):
-                args = dict(base)
-                args[exp_key] = exp_val
+    attempts = []
+    for base in bases:
+        for exp in expiry_vals:
+            for expk in ("expiry","Expiry","ExpiryDate","Expiry_Date"):
+                args = dict(base); args[expk] = exp
                 try:
                     try:
                         resp = dhan.option_chain(**args)
-                        # If response is failure-like, ignore
                         if isinstance(resp, dict) and resp.get("status") and str(resp.get("status")).lower() == "failure":
-                            tried.append((args, "failure-response"))
+                            attempts.append((args, "failure"))
                             continue
                         return resp
                     except TypeError:
-                        # maybe single dict
                         resp = dhan.option_chain(args)
                         if isinstance(resp, dict) and resp.get("status") and str(resp.get("status")).lower() == "failure":
-                            tried.append((args, "failure-response"))
+                            attempts.append((args, "failure"))
                             continue
                         return resp
                     except Exception as e:
-                        tried.append((args, str(e)))
+                        attempts.append((args, str(e)))
                         continue
                 except Exception as e:
-                    tried.append((args, str(e)))
+                    attempts.append((args, str(e)))
                     continue
-    logger.debug("option_chain sdk tries: %s", tried)
+    logger.debug("SDK option_chain attempts: %s", attempts)
     return None
 
 # ---------------- normalization & spot extraction helpers ----------------
@@ -285,10 +299,6 @@ def safe_get_ltp_from_quote_response(resp):
         return None
 
 def extract_spot_from_chain(raw):
-    """
-    Returns (spot: float or None, preview: str, inferred_flag: bool).
-    Treats responses with status:failure as not usable.
-    """
     try:
         preview = ""
         if not raw:
@@ -297,16 +307,13 @@ def extract_spot_from_chain(raw):
             preview = json.dumps(raw)[:1200]
         except:
             preview = str(raw)[:1200]
-
-        # If API explicitly returns failure wrapper -> not usable
+        # if API explicitly failure -> not usable
         if isinstance(raw, dict) and raw.get("status") and str(raw.get("status")).lower() == "failure":
             return None, preview, False
-
-        # search for common keys
         def to_num(v):
             try:
                 if v is None: return None
-                if isinstance(v, (int, float)): return float(v)
+                if isinstance(v, (int,float)): return float(v)
                 s = str(v).strip().replace(',', '')
                 if s == "": return None
                 if any(c.isalpha() for c in s) and not any(ch.isdigit() for ch in s):
@@ -314,35 +321,31 @@ def extract_spot_from_chain(raw):
                 return float(s)
             except:
                 return None
-
-        key_patterns = ("underlying","underlyinglast","underlyinglastprice","underlying_price","underlyingltp","spot","ltp","lastprice","last_price","last")
-        found = []
-
-        def recurse(obj):
-            if obj is None: return
-            if isinstance(obj, dict):
-                for k,v in obj.items():
+        patterns = ("underlying","underlyinglast","underlyinglastprice","underlying_price","underlyingltp","spot","ltp","lastprice","last_price","last")
+        found=[]
+        def recurse(o):
+            if o is None: return
+            if isinstance(o, dict):
+                for k,v in o.items():
                     lk = str(k).lower()
-                    for pat in key_patterns:
-                        if pat in lk:
-                            num = to_num(v)
-                            if num is not None:
-                                found.append(num); return
+                    for p in patterns:
+                        if p in lk:
+                            n = to_num(v)
+                            if n is not None:
+                                found.append(n); return
                     recurse(v)
-            elif isinstance(obj, list):
-                for item in obj[:200]:
+            elif isinstance(o, list):
+                for item in o[:200]:
                     recurse(item)
             else:
-                num = to_num(obj)
-                if num is not None:
-                    found.append(num)
-
+                n = to_num(o)
+                if n is not None:
+                    found.append(n)
         recurse(raw)
         if found:
             return float(found[0]), preview, False
-
-        # infer from strikes if present
-        strikes = []
+        # infer from strikes
+        strikes=[]
         data = raw.get("data") if isinstance(raw, dict) and "data" in raw else raw
         target = data
         if isinstance(data, dict):
@@ -354,23 +357,18 @@ def extract_spot_from_chain(raw):
                 if not isinstance(item, dict): continue
                 for k in ("strike","strikeprice","strike_price","sem_strike_price","StrikePrice"):
                     if k in item:
-                        try:
-                            strikes.append(int(float(item[k])))
-                        except:
-                            pass
+                        try: strikes.append(int(float(item[k])))
+                        except: pass
                 for side in ("CE","PE","call","put"):
                     if side in item and isinstance(item[side], dict):
                         for kk in ("strike","StrikePrice"):
                             if kk in item[side]:
-                                try:
-                                    strikes.append(int(float(item[side][kk])))
-                                except:
-                                    pass
+                                try: strikes.append(int(float(item[side][kk])))
+                                except: pass
         if strikes:
             strikes_sorted = sorted(set(strikes))
             mid = strikes_sorted[len(strikes_sorted)//2]
             return float(mid), preview, True
-
         return None, preview, False
     except Exception as e:
         logger.exception("extract_spot_from_chain fail: %s", e)
@@ -383,9 +381,8 @@ def choose_strikes_around_atm(atm, gap, total=10):
     return strikes
 
 def parse_option_chain_raw(raw):
-    rows = []
-    if not raw:
-        return rows
+    rows=[]
+    if not raw: return rows
     data = raw.get("data") if isinstance(raw, dict) and "data" in raw else raw
     if isinstance(data, dict):
         for k in ("options","optionChain","records","rows","data","optionsList"):
@@ -394,22 +391,18 @@ def parse_option_chain_raw(raw):
     if isinstance(data, list):
         for item in data:
             if not isinstance(item, dict): continue
-            strike = None
+            strike=None
             for k in ("strike","StrikePrice","strikePrice","SEM_STRIKE_PRICE"):
                 if k in item:
-                    try:
-                        strike = int(float(item[k])); break
-                    except:
-                        pass
+                    try: strike=int(float(item[k])); break
+                    except: pass
             if strike is None:
                 if 'CE' in item and isinstance(item['CE'], dict):
-                    try:
-                        strike = int(float(item['CE'].get('strike') or item['CE'].get('StrikePrice') or item['CE'].get('SEM_STRIKE_PRICE')))
-                    except:
-                        strike = None
+                    try: strike=int(float(item['CE'].get('strike') or item['CE'].get('StrikePrice') or item['CE'].get('SEM_STRIKE_PRICE')))
+                    except: strike=None
             if strike is None: continue
-            ce = item.get('CE') or item.get('call') or None
-            pe = item.get('PE') or item.get('put') or None
+            ce=item.get('CE') or item.get('call') or None
+            pe=item.get('PE') or item.get('put') or None
             def ext(o):
                 if not o or not isinstance(o, dict): return {'ltp':0.0,'oi':0,'volume':0}
                 l=0.0; oi=0; vol=0
@@ -430,9 +423,9 @@ def parse_option_chain_raw(raw):
     elif isinstance(data, dict):
         for k,v in data.items():
             try:
-                s = int(float(k))
-                ce = v.get('CE') if isinstance(v, dict) else None
-                pe = v.get('PE') if isinstance(v, dict) else None
+                s=int(float(k))
+                ce=v.get('CE') if isinstance(v, dict) else None
+                pe=v.get('PE') if isinstance(v, dict) else None
                 def ext(o):
                     if not o: return {'ltp':0.0,'oi':0,'volume':0}
                     l=0.0; oi=0; vol=0
@@ -455,34 +448,33 @@ def parse_option_chain_raw(raw):
     return rows
 
 def format_for_telegram(index_name, spot, expiry, strikes, strike_rows, spot_inferred=False):
-    m = {r['strike']: {'CE': r.get('CE',{}), 'PE': r.get('PE',{})} for r in strike_rows}
-    lines = []
-    inferred_note = " (inferred)" if spot_inferred else ""
+    m={r['strike']:{'CE':r.get('CE',{}),'PE':r.get('PE',{})} for r in strike_rows}
+    lines=[]
+    inferred_note=" (inferred)" if spot_inferred else ""
     lines.append(f"📊 <b>{index_name}</b>  | Spot: <b>₹{spot:,.2f}</b>{inferred_note}  | Expiry: {expiry}")
     lines.append("<code>  CE_LTP   CE_OI    STRIKE    PE_LTP   PE_OI</code>")
     lines.append("─"*60)
     for s in sorted(strikes):
-        d = m.get(s, {'CE':{'ltp':0,'oi':0}, 'PE':{'ltp':0,'oi':0}})
-        ce = d['CE']; pe = d['PE']
-        try: ce_ltp = float(ce.get('ltp', 0.0))
-        except: ce_ltp = 0.0
-        try: pe_ltp = float(pe.get('ltp', 0.0))
-        except: pe_ltp = 0.0
-        try: ce_oi = int(ce.get('oi', 0))
-        except: ce_oi = 0
-        try: pe_oi = int(pe.get('oi', 0))
-        except: pe_oi = 0
+        d=m.get(s,{'CE':{'ltp':0,'oi':0},'PE':{'ltp':0,'oi':0}})
+        ce=d['CE']; pe=d['PE']
+        try: ce_ltp=float(ce.get('ltp',0.0))
+        except: ce_ltp=0.0
+        try: pe_ltp=float(pe.get('ltp',0.0))
+        except: pe_ltp=0.0
+        try: ce_oi=int(ce.get('oi',0))
+        except: ce_oi=0
+        try: pe_oi=int(pe.get('oi',0))
+        except: pe_oi=0
         lines.append(f"<code>{ce_ltp:8.1f} {ce_oi:8d} {int(s):10d} {pe_ltp:8.1f} {pe_oi:8d}</code>")
     lines.append("─"*60)
     lines.append(f"🕐 {time.strftime('%Y-%m-%d %H:%M:%S')}")
     return "\n".join(lines)
 
-# ---------------- main bot loop ----------------
+# ---------------- main loop ----------------
 def bot_loop():
     if not all(REQUIRED):
-        logger.error("Missing required env vars: DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+        logger.error("Missing required env vars")
         return
-
     try:
         dhan = make_dhan()
         logger.info("✅ Dhan client initialized")
@@ -493,72 +485,56 @@ def bot_loop():
         tele_send_http(TELE_CHAT_ID, f"❌ Dhan init failed: {e}")
         return
 
-    iteration = 0
+    iter_no=0
     while True:
-        iteration += 1
-        logger.info("=== Iteration #%d ===", iteration)
+        iter_no+=1
+        logger.info("=== Iteration #%d ===", iter_no)
         try:
-            # expiries as date objects
             nifty_expiry_date = datetime.strptime(NIFTY_EXPIRY, "%Y-%m-%d").date() if NIFTY_EXPIRY else weekly_expiry_for_index("NIFTY")
             bank_expiry_date = datetime.strptime(BANKNIFTY_EXPIRY, "%Y-%m-%d").date() if BANKNIFTY_EXPIRY else weekly_expiry_for_index("BANKNIFTY")
 
-            # --- NIFTY ---
-            spot_n = None
-            spot_n_inferred = False
+            # NIFTY
+            spot_n=None; spot_n_inferred=False
             try:
                 resp_q = try_quote_data(dhan, IDX_KEY, NIFTY_ID)
                 spot_n = safe_get_ltp_from_quote_response(resp_q)
             except Exception as e:
                 logger.debug("quote_data exception for NIFTY: %s", e)
 
-            raw_chain_n = None
-            # Try SDK first (with expiry variants inside)
             raw_chain_n = try_option_chain_sdk(dhan, NIFTY_ID, nifty_expiry_date, IDX_KEY)
             if raw_chain_n:
                 s, preview, inferred = extract_spot_from_chain(raw_chain_n)
                 logger.info("NIFTY raw_chain preview (first 1200 chars): %s", preview)
                 if s is not None:
-                    spot_n = s; spot_n_inferred = bool(inferred)
-            # If chain exists but spot still None -> try REST (if allowed)
-            if raw_chain_n and spot_n is None:
+                    spot_n=s; spot_n_inferred=bool(inferred)
+
+            if (raw_chain_n and spot_n is None) or (raw_chain_n is None):
                 rest_chain = rest_option_chain(NIFTY_ID, IDX_KEY, nifty_expiry_date)
                 if rest_chain:
                     s2, preview2, inferred2 = extract_spot_from_chain(rest_chain)
                     logger.info("NIFTY REST preview (first 1200 chars): %s", preview2)
                     if s2 is not None:
-                        spot_n = s2; spot_n_inferred = bool(inferred2)
-                        raw_chain_n = rest_chain
-            # If no SDK chain, try REST directly
-            if raw_chain_n is None:
-                raw_chain_n = rest_option_chain(NIFTY_ID, IDX_KEY, nifty_expiry_date)
-                if raw_chain_n:
-                    s3, preview3, inferred3 = extract_spot_from_chain(raw_chain_n)
-                    logger.info("NIFTY REST preview (first 1200 chars): %s", preview3)
-                    if s3 is not None:
-                        spot_n = s3; spot_n_inferred = bool(inferred3)
+                        spot_n=s2; spot_n_inferred=bool(inferred2); raw_chain_n=rest_chain
 
             if raw_chain_n and spot_n is not None:
-                gap = 50
-                atm = round(spot_n / gap) * gap
-                strikes = choose_strikes_around_atm(atm, gap, total=STRIKE_COUNT)
-                parsed_rows = parse_option_chain_raw(raw_chain_n)
-                filtered = [r for r in parsed_rows if r['strike'] in strikes]
+                gap=50; atm=round(spot_n/gap)*gap
+                strikes=choose_strikes_around_atm(atm,gap,total=STRIKE_COUNT)
+                parsed_rows=parse_option_chain_raw(raw_chain_n)
+                filtered=[r for r in parsed_rows if r['strike'] in strikes]
                 for s in strikes:
                     if not any(r['strike']==s for r in filtered):
                         filtered.append({'strike':s,'CE':{'ltp':0.0,'oi':0,'volume':0},'PE':{'ltp':0.0,'oi':0,'volume':0}})
-                text = format_for_telegram("NIFTY 50", spot_n, nifty_expiry_date.strftime("%Y-%m-%d"), strikes, filtered, spot_inferred=spot_n_inferred)
+                text=format_for_telegram("NIFTY 50", spot_n, nifty_expiry_date.strftime("%Y-%m-%d"), strikes, filtered, spot_inferred=spot_n_inferred)
                 tele_send_http(TELE_CHAT_ID, text)
-                logger.info("Sent NIFTY option chain (strikes=%d) to Telegram", len(strikes))
+                logger.info("Sent NIFTY option chain (strikes=%d)", len(strikes))
             else:
                 logger.warning("Could not fetch complete NIFTY data (spot:%s, chain:%s)", bool(spot_n), bool(raw_chain_n))
-                # only send incomplete alert if both SDK and REST failed or are blocked
                 tele_send_http(TELE_CHAT_ID, f"⚠️ NIFTY fetch incomplete. spot={spot_n is not None}, chain={raw_chain_n is not None}")
 
             time.sleep(1)
 
-            # --- BANKNIFTY ---
-            spot_b = None
-            spot_b_inferred = False
+            # BANKNIFTY (same)
+            spot_b=None; spot_b_inferred=False
             try:
                 resp_qb = try_quote_data(dhan, IDX_KEY, BANKNIFTY_ID)
                 spot_b = safe_get_ltp_from_quote_response(resp_qb)
@@ -570,34 +546,27 @@ def bot_loop():
                 s, preview, inferred = extract_spot_from_chain(raw_chain_b)
                 logger.info("BANKNIFTY raw_chain preview (first 1200 chars): %s", preview)
                 if s is not None:
-                    spot_b = s; spot_b_inferred = bool(inferred)
-            if raw_chain_b and spot_b is None:
+                    spot_b=s; spot_b_inferred=bool(inferred)
+
+            if (raw_chain_b and spot_b is None) or (raw_chain_b is None):
                 rest_chain_b = rest_option_chain(BANKNIFTY_ID, IDX_KEY, bank_expiry_date)
                 if rest_chain_b:
                     s2, preview2, inferred2 = extract_spot_from_chain(rest_chain_b)
                     logger.info("BANKNIFTY REST preview (first 1200 chars): %s", preview2)
                     if s2 is not None:
-                        spot_b = s2; spot_b_inferred = bool(inferred2); raw_chain_b = rest_chain_b
-            if raw_chain_b is None:
-                raw_chain_b = rest_option_chain(BANKNIFTY_ID, IDX_KEY, bank_expiry_date)
-                if raw_chain_b:
-                    s3, preview3, inferred3 = extract_spot_from_chain(raw_chain_b)
-                    logger.info("BANKNIFTY REST preview (first 1200 chars): %s", preview3)
-                    if s3 is not None:
-                        spot_b = s3; spot_b_inferred = bool(inferred3)
+                        spot_b=s2; spot_b_inferred=bool(inferred2); raw_chain_b=rest_chain_b
 
             if raw_chain_b and spot_b is not None:
-                gapb = 100
-                atmb = round(spot_b / gapb) * gapb
-                strikes_b = choose_strikes_around_atm(atmb, gapb, total=STRIKE_COUNT)
-                parsed_b = parse_option_chain_raw(raw_chain_b)
-                filtered_b = [r for r in parsed_b if r['strike'] in strikes_b]
+                gapb=100; atmb=round(spot_b/gapb)*gapb
+                strikes_b=choose_strikes_around_atm(atmb,gapb,total=STRIKE_COUNT)
+                parsed_b=parse_option_chain_raw(raw_chain_b)
+                filtered_b=[r for r in parsed_b if r['strike'] in strikes_b]
                 for s in strikes_b:
                     if not any(r['strike']==s for r in filtered_b):
                         filtered_b.append({'strike':s,'CE':{'ltp':0.0,'oi':0,'volume':0},'PE':{'ltp':0.0,'oi':0,'volume':0}})
-                textb = format_for_telegram("BANK NIFTY", spot_b, bank_expiry_date.strftime("%Y-%m-%d"), strikes_b, filtered_b, spot_inferred=spot_b_inferred)
+                textb=format_for_telegram("BANK NIFTY", spot_b, bank_expiry_date.strftime("%Y-%m-%d"), strikes_b, filtered_b, spot_inferred=spot_b_inferred)
                 tele_send_http(TELE_CHAT_ID, textb)
-                logger.info("Sent BANKNIFTY option chain (strikes=%d) to Telegram", len(strikes_b))
+                logger.info("Sent BANKNIFTY option chain (strikes=%d)", len(strikes_b))
             else:
                 logger.warning("Could not fetch complete BANKNIFTY data (spot:%s, chain:%s)", bool(spot_b), bool(raw_chain_b))
                 tele_send_http(TELE_CHAT_ID, f"⚠️ BANKNIFTY fetch incomplete. spot={spot_b is not None}, chain={raw_chain_b is not None}")
