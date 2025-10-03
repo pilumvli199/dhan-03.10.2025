@@ -10,7 +10,7 @@ from dhanhq import dhanhq
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('dhanhq-option-chain-bot')
 
-# Load config from env
+# Config from env
 DHAN_CLIENT_ID = os.getenv('DHAN_CLIENT_ID')
 DHAN_ACCESS_TOKEN = os.getenv('DHAN_ACCESS_TOKEN')
 TELE_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -21,22 +21,14 @@ REQUIRED = [DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELE_TOKEN, TELE_CHAT_ID]
 
 app = Flask(__name__)
 
-# Exchange segment constants for DhanHQ 2.0+ (if library exposes constants, use them)
-# We'll use dhanhq object's properties when calling API (dhan.NSE, dhan.NSE_FNO, etc.)
-
 def tele_send_http(chat_id: str, text: str):
-    """Send message using Telegram Bot HTTP API"""
     try:
         token = TELE_TOKEN
         if not token:
             logger.error('TELEGRAM_BOT_TOKEN not set')
             return False
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML"
-        }
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code != 200:
             logger.warning('Telegram API returned %s: %s', r.status_code, r.text)
@@ -47,7 +39,6 @@ def tele_send_http(chat_id: str, text: str):
         return False
 
 def get_nifty_expiry():
-    """Get NIFTY 50 weekly expiry (next Thursday)"""
     today = datetime.now()
     days_ahead = 3 - today.weekday()  # Thursday is 3
     if days_ahead <= 0:
@@ -56,7 +47,6 @@ def get_nifty_expiry():
     return expiry.strftime('%Y-%m-%d')
 
 def get_banknifty_expiry():
-    """Get BANKNIFTY weekly expiry (next Wednesday)"""
     today = datetime.now()
     days_ahead = 2 - today.weekday()  # Wednesday is 2
     if days_ahead <= 0:
@@ -65,18 +55,19 @@ def get_banknifty_expiry():
     return expiry.strftime('%Y-%m-%d')
 
 def parse_expiry_string(expiry_str):
-    """Try multiple expiry date formats and return datetime.date or None."""
-    from datetime import datetime
     if not expiry_str:
         return None
     expiry_str = expiry_str.strip()
-    formats = ['%d-%b-%Y', '%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%d-%b-%y', '%d %b %Y']
-    for fmt in formats:
+    fmts = [
+        '%d-%b-%Y', '%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%d-%b-%y', '%d %b %Y',
+        '%Y-%m-%d %H:%M:%S', '%d-%b-%Y %H:%M:%S'
+    ]
+    for fmt in fmts:
         try:
             return datetime.strptime(expiry_str, fmt).date()
         except Exception:
             continue
-    # last-resort pattern like '07Oct2025'
+    # try pattern like '07Oct2025' or '07Oct2025 00:00:00'
     try:
         import re
         m = re.search(r'(\d{1,2}).*?([A-Za-z]{3}).*?(\d{4})', expiry_str)
@@ -88,236 +79,157 @@ def parse_expiry_string(expiry_str):
     return None
 
 def get_instruments(dhan):
-    """Download and inspect instruments CSV; return filtered F&O option instruments (robust)."""
+    """Download and filter only NIFTY / BANKNIFTY Index Options (OPTIDX)."""
     try:
-        logger.info("📥 Downloading instruments from DhanHQ API (robust loader)...")
+        logger.info("📥 Downloading instruments from DhanHQ CSV...")
         url = "https://images.dhan.co/api-data/api-scrip-master.csv"
         resp = requests.get(url, timeout=60)
         resp.raise_for_status()
-        text = resp.text
-
-        # parse CSV and inspect header & first rows
         import csv
         from io import StringIO
-        csv_data = StringIO(text)
-        reader = csv.DictReader(csv_data)
-        rows = []
-        for i, r in enumerate(reader):
-            if i < 10:
-                rows.append(r)
-            else:
-                break
+        reader = csv.DictReader(StringIO(resp.text))
 
-        if not rows:
-            logger.warning("⚠️ CSV parsed but no rows found in preview.")
-            return []
-
-        # Log header keys and a sample row for debugging
-        sample_keys = list(rows[0].keys())
-        logger.debug("CSV header keys (sample): %s", sample_keys)
-        logger.debug("CSV sample row 0 keys/values (trimmed): %s",
-                     {k: rows[0].get(k) for k in sample_keys[:20]})
-
-        # Heuristic: find likely column names for exchange, symbol, instr type, expiry, strike, security id
-        def pick(col_candidates):
-            for c in col_candidates:
-                if c in sample_keys:
-                    return c
-            return None
-
-        col_exchange = pick(['SEM_EXM_EXCH_ID', 'EXCHANGE_ID', 'EXCH_SEGMENT', 'EXCHANGE'])
-        col_symbol = pick(['SEM_TRADING_SYMBOL', 'TRADING_SYMBOL', 'SYMBOL', 'SEM_SYMB'])
-        col_instrument_name = pick(['SEM_INSTRUMENT_NAME', 'INSTRUMENT_NAME', 'INSTRUMENT'])
-        col_expiry = pick(['SEM_EXPIRY_DATE', 'EXPIRY_DATE', 'EXPIRY'])
-        col_strike = pick(['SEM_STRIKE_PRICE', 'STRIKE_PRICE', 'STRIKE'])
-        col_option_type = pick(['SEM_OPTION_TYPE', 'OPTION_TYPE', 'OPT_TYPE'])
-        col_security_id = pick(['SEM_SMST_SECURITY_ID', 'SMST_SECURITY_ID', 'SECURITY_ID', 'SMST_SECURITY_ID'])
-
-        logger.debug("Detected columns -> exchange: %s, symbol: %s, instr_name: %s, expiry: %s, strike: %s, opt_type: %s, secid: %s",
-                     col_exchange, col_symbol, col_instrument_name, col_expiry, col_strike, col_option_type, col_security_id)
-
-        # Now re-iterate full CSV and filter robustly
-        csv_data = StringIO(text)
-        reader = csv.DictReader(csv_data)
         fno_instruments = []
         for inst in reader:
             try:
-                symbol = inst.get(col_symbol, '') or inst.get('SEM_TRADING_SYMBOL', '') or ''
-                instr_name = inst.get(col_instrument_name, '') or ''
-                exch = inst.get(col_exchange, '') or ''
-                # Normalize values to upper-case strings for safe checks
-                symbol_u = symbol.upper()
-                instr_name_u = instr_name.upper()
-                exch_u = str(exch).strip()
+                instr_name = (inst.get("SEM_INSTRUMENT_NAME") or '').upper()
+                symbol = (inst.get("SEM_TRADING_SYMBOL") or '').upper()
+                secid = inst.get("SEM_SMST_SECURITY_ID") or ''
+                expiry = inst.get("SEM_EXPIRY_DATE") or ''
+                strike = inst.get("SEM_STRIKE_PRICE") or ''
+                opt_type = (inst.get("SEM_OPTION_TYPE") or '').upper()
 
-                # Heuristics to identify F&O option indexes:
-                # - instrument name contains 'OPT' (OPTIDX / OPTOBJ / OPT)
-                # - exchange indicates F&O / NSE F&O (e.g., '2' in old CSVs) OR symbol contains 'NIFTY'/'BANKNIFTY'
-                is_option = 'OPT' in instr_name_u or instr_name_u.startswith('OPTION') or 'OPTION' in instr_name_u
-                is_index_underlying = ('NIFTY' in symbol_u) or ('BANKNIFTY' in symbol_u) or ('BANK NIFTY'.replace(' ', '') in symbol_u)
-                is_fno_exchange = exch_u in ('2', 'FNO', 'NSE_FNO', 'NSE-FNO')
-
-                # Accept if looks like an index option on NIFTY / BANKNIFTY
-                if is_option and (is_index_underlying or is_fno_exchange):
-                    # build normalized fields
-                    expiry_raw = inst.get(col_expiry, '') or inst.get('SEM_EXPIRY_DATE', '') or ''
-                    expiry_date = parse_expiry_string(expiry_raw)
-                    strike = inst.get(col_strike, '') or inst.get('SEM_STRIKE_PRICE', '') or ''
+                # Filter: instrument name must be OPTIDX and symbol must contain NIFTY or BANKNIFTY
+                if instr_name == "OPTIDX" and ("NIFTY" in symbol or "BANKNIFTY" in symbol.replace(" ", "")):
+                    # Normalize strike
                     try:
-                        strike_val = float(str(strike)) if strike not in (None, '') else None
+                        strike_val = float(strike)
                     except Exception:
-                        strike_val = None
-                    option_type = (inst.get(col_option_type) or inst.get('SEM_OPTION_TYPE') or '').upper()
-                    secid = inst.get(col_security_id) or inst.get('SEM_SMST_SECURITY_ID') or inst.get('SMST_SECURITY_ID') or ''
+                        # sometimes strike is '-0.01000' for FUT/others; skip non-numeric
+                        continue
 
-                    # add if we have strike and expiry and symbol contains NIFTY/BANKNIFTY
-                    if (strike_val is not None) and expiry_date and ('NIFTY' in symbol_u or 'BANK' in symbol_u):
-                        fno_instruments.append({
-                            'SEM_TRADING_SYMBOL': symbol,
-                            'SEM_EXPIRY_DATE': expiry_raw,
-                            'SEM_STRIKE_PRICE': strike_val,
-                            'SEM_OPTION_TYPE': option_type,
-                            'SEM_SMST_SECURITY_ID': secid
-                        })
+                    # expiry parsing to ensure valid
+                    if not parse_expiry_string(expiry):
+                        continue
+
+                    fno_instruments.append({
+                        "SEM_TRADING_SYMBOL": symbol,
+                        "SEM_EXPIRY_DATE": expiry,
+                        "SEM_STRIKE_PRICE": strike_val,
+                        "SEM_OPTION_TYPE": opt_type,
+                        "SEM_SMST_SECURITY_ID": secid
+                    })
             except Exception:
                 continue
 
-        logger.info(f"✅ Found {len(fno_instruments)} F&O option instruments (robust filter).")
-        # If still zero, log first 50 sample symbols to inspect
+        logger.info(f"✅ Filtered {len(fno_instruments)} index option instruments")
         if len(fno_instruments) == 0:
-            sample_symbols = []
-            csv_data = StringIO(text)
-            reader = csv.DictReader(csv_data)
-            for i, r in enumerate(reader):
+            # For debugging: sample some symbols
+            resp2 = requests.get(url, timeout=60)
+            reader2 = csv.DictReader(StringIO(resp2.text))
+            sample = []
+            for i, r in enumerate(reader2):
                 if i >= 50: break
-                sample_symbols.append(r.get(col_symbol) or r.get('SEM_TRADING_SYMBOL') or '')
-            logger.warning("Sample symbols (first 50) for inspection: %s", sample_symbols[:20])
+                sample.append(r.get("SEM_TRADING_SYMBOL") or r.get("SM_SYMBOL_NAME") or '')
+            logger.warning("Sample symbols (first 50): %s", sample[:20])
 
         return fno_instruments
 
     except Exception as e:
-        logger.exception(f"❌ Error fetching instruments (robust): {e}")
+        logger.exception("❌ Error fetching instruments: %s", e)
         return []
 
 def get_spot_price_dhan(dhan, index_name):
-    """Get spot price for NIFTY or BANKNIFTY"""
     try:
-        # DhanHQ Index security IDs might vary; using previously known mapping
-        # NIFTY 50 = 13, BANKNIFTY = 25 (these are examples; verify in your account)
+        # Known mapping (may vary by account) — update if needed
         security_id = 13 if index_name == 'NIFTY' else 25
-
-        # Fetch LTP using market quote API
-        response = dhan.market_quote(
-            security_id=str(security_id),
-            exchange_segment=getattr(dhan, 'NSE', None) or 'NSE'
-        )
-
+        exchange_seg = getattr(dhan, 'NSE', None) or 'NSE'
+        response = dhan.market_quote(security_id=str(security_id), exchange_segment=exchange_seg)
         if response and response.get('status') in ('success', True):
             data = response.get('data', {})
-            # Typical keys may be 'LTP' or 'ltp'
             ltp_val = data.get('LTP') or data.get('ltp') or data.get('last_price') or 0
             ltp = float(ltp_val) if ltp_val not in (None, '') else 0.0
-            logger.info(f"✅ {index_name} Spot: ₹{ltp:,.2f}")
+            logger.info("✅ %s Spot: ₹%s", index_name, f"{ltp:,.2f}")
             return ltp
         else:
-            logger.error(f"Failed to get spot price: {response}")
+            logger.error("Failed to get spot price: %s", response)
             return None
-
     except Exception as e:
-        logger.exception(f"❌ Error getting spot price: {e}")
+        logger.exception("❌ Error getting spot price: %s", e)
         return None
 
 def find_option_contracts(instruments, index_name, expiry_date, spot_price):
-    """Find option contracts for strikes around spot price (robust expiry parsing)"""
     try:
-        logger.info(f"🔍 Finding options for {index_name}, expiry: {expiry_date}")
-
+        logger.info("🔍 Finding options for %s, expiry: %s", index_name, expiry_date)
         if index_name == 'NIFTY':
             strike_gap = 50
-            underlying = 'NIFTY'
+            underlying_token = 'NIFTY'
         else:
             strike_gap = 100
-            underlying = 'BANKNIFTY'
+            underlying_token = 'BANKNIFTY'
 
         atm = round(spot_price / strike_gap) * strike_gap
-        strikes = []
-        for i in range(-5, 6):
-            strikes.append(atm + (i * strike_gap))
+        strikes = [atm + (i * strike_gap) for i in range(-5, 6)]
+        logger.info("🎯 ATM: %s, Strikes: %s..%s", atm, min(strikes), max(strikes))
 
-        logger.info(f"🎯 ATM: {atm}, Strikes: {min(strikes)} to {max(strikes)}")
-
-        # Filter instruments
         option_contracts = []
-        target_dt = None
         try:
             target_dt = datetime.strptime(expiry_date, '%Y-%m-%d').date()
         except Exception:
-            logger.debug("Target expiry parse failed for %s", expiry_date)
-            # fallback: try parse_expiry_string on given expiry_date string
-            try:
-                target_dt = parse_expiry_string(expiry_date)
-            except Exception:
-                target_dt = None
+            target_dt = parse_expiry_string(expiry_date)
+
+        if target_dt is None:
+            logger.warning("Target expiry couldn't be parsed: %s", expiry_date)
+            return []
 
         for inst in instruments:
             try:
                 sym = (inst.get('SEM_TRADING_SYMBOL') or '').upper()
                 inst_expiry_raw = inst.get('SEM_EXPIRY_DATE', '')
                 exp_dt = parse_expiry_string(inst_expiry_raw)
-                if exp_dt is None or target_dt is None:
+                if exp_dt is None:
                     continue
-
-                # match expiry
                 if exp_dt != target_dt:
                     continue
 
-                strike = inst.get('SEM_STRIKE_PRICE')
+                strike_val = inst.get('SEM_STRIKE_PRICE')
                 try:
-                    strike_val = float(strike)
+                    strike_val = float(strike_val)
                 except Exception:
                     continue
 
-                if strike_val in strikes and underlying in sym:
-                    option_type = inst.get('SEM_OPTION_TYPE') or ''
-                    secid = inst.get('SEM_SMST_SECURITY_ID') or ''
+                if strike_val in strikes and underlying_token in sym:
                     option_contracts.append({
                         'strike': strike_val,
-                        'type': option_type,
-                        'security_id': secid,
+                        'type': inst.get('SEM_OPTION_TYPE') or '',
+                        'security_id': inst.get('SEM_SMST_SECURITY_ID') or '',
                         'symbol': inst.get('SEM_TRADING_SYMBOL'),
                         'expiry': inst_expiry_raw
                     })
             except Exception:
                 continue
 
-        logger.info(f"✅ Found {len(option_contracts)} option contracts")
+        logger.info("✅ Found %d option contracts", len(option_contracts))
         return sorted(option_contracts, key=lambda x: (x['strike'], x['type']))
 
     except Exception as e:
-        logger.exception(f"❌ Error finding option contracts: {e}")
+        logger.exception("❌ Error finding option contracts: %s", e)
         return []
 
 def get_option_chain_data(dhan, option_contracts):
-    """Fetch option chain data with OI and Volume"""
     try:
         if not option_contracts:
             return {}
-
-        logger.info(f"📡 Fetching data for {len(option_contracts)} options...")
-
+        logger.info("📡 Fetching data for %d options...", len(option_contracts))
         result = {}
+        exchange_seg = getattr(dhan, 'NSE_FNO', None) or getattr(dhan, 'FNO', None) or 'NSE_FNO'
 
-        # Fetch quotes in batches (API works better with individual calls)
-        for opt in option_contracts[:40]:  # Increased limit for more strikes if needed
+        for opt in option_contracts[:40]:
             try:
                 sec_id = str(opt['security_id'])
-                # use FNO exchange segment if available on the dhanhq object
-                exchange_seg = getattr(dhan, 'NSE_FNO', None) or getattr(dhan, 'FNO', None) or 'NSE_FNO'
-                response = dhan.market_quote(
-                    security_id=sec_id,
-                    exchange_segment=exchange_seg
-                )
-
+                if not sec_id:
+                    continue
+                response = dhan.market_quote(security_id=sec_id, exchange_segment=exchange_seg)
                 if response and response.get('status') in ('success', True):
                     data = response.get('data', {})
                     ltp_val = data.get('LTP') or data.get('ltp') or data.get('last_price') or 0
@@ -330,103 +242,64 @@ def get_option_chain_data(dhan, option_contracts):
                         'volume': int(vol_val) if vol_val not in (None, '') else 0,
                         'change': float(change_val) if change_val not in (None, '') else 0.0
                     }
-
-                time.sleep(0.08)  # Small delay between requests
-
+                time.sleep(0.08)
             except Exception as e:
-                logger.warning(f"Failed to get quote for {sec_id}: {e}")
+                logger.warning("Failed to get quote for %s: %s", opt.get('security_id'), e)
                 continue
 
-        logger.info(f"✅ Fetched data for {len(result)} options")
+        logger.info("✅ Fetched data for %d options", len(result))
         return result
-
     except Exception as e:
-        logger.exception(f"❌ Error fetching option data: {e}")
+        logger.exception("❌ Error fetching option data: %s", e)
         return {}
 
-def calculate_strikes(spot_price, index_name, num_strikes=5):
-    """Calculate ATM and surrounding strikes"""
-    if index_name == 'NIFTY':
-        strike_gap = 50
-    else:
-        strike_gap = 100
-
-    atm = round(spot_price / strike_gap) * strike_gap
-    strikes = []
-
-    for i in range(-num_strikes, num_strikes + 1):
-        strikes.append(atm + (i * strike_gap))
-
-    return sorted(strikes)
-
 def format_option_chain_message(index_name, spot_price, expiry, option_contracts, market_data):
-    """Format option chain data for Telegram with OI and Volume"""
     messages = []
     messages.append(f"📊 <b>{index_name}</b>")
     messages.append(f"💰 Spot: <b>₹{spot_price:,.2f}</b> | 📅 {expiry}\n")
-
-    # Header
     messages.append("<code>═══ CALL ═══╬══STRIKE══╬═══ PUT ═══</code>")
     messages.append("<code>  LTP    OI  ║  Price  ║  LTP    OI </code>")
     messages.append("─" * 42)
 
-    # Group by strike
     strikes = {}
     for opt in option_contracts:
         strike = opt['strike']
         if strike not in strikes:
             strikes[strike] = {'CE': None, 'PE': None}
-
         sec_id = str(opt['security_id'])
         data = market_data.get(sec_id, {})
-
         strikes[strike][opt['type']] = data
 
-    total_ce_oi = 0
-    total_pe_oi = 0
-    total_ce_vol = 0
-    total_pe_vol = 0
+    total_ce_oi = total_pe_oi = total_ce_vol = total_pe_vol = 0
 
     for strike in sorted(strikes.keys()):
-        ce_data = strikes[strike].get('CE', {}) or {}
-        pe_data = strikes[strike].get('PE', {}) or {}
-
+        ce_data = strikes[strike].get('CE') or {}
+        pe_data = strikes[strike].get('PE') or {}
         ce_ltp = ce_data.get('ltp', 0)
         ce_oi = ce_data.get('oi', 0)
         ce_vol = ce_data.get('volume', 0)
-
         pe_ltp = pe_data.get('ltp', 0)
         pe_oi = pe_data.get('oi', 0)
         pe_vol = pe_data.get('volume', 0)
-
         total_ce_oi += ce_oi
         total_pe_oi += pe_oi
         total_ce_vol += ce_vol
         total_pe_vol += pe_vol
-
-        # Format OI in K
         ce_oi_str = f"{ce_oi//1000}K" if ce_oi >= 1000 else f"{ce_oi}"
         pe_oi_str = f"{pe_oi//1000}K" if pe_oi >= 1000 else f"{pe_oi}"
-
-        # Format row
         ce_str = f"{ce_ltp:>6.1f} {ce_oi_str:>5}" if ce_ltp > 0 else "   -      -  "
         pe_str = f"{pe_ltp:>6.1f} {pe_oi_str:>5}" if pe_ltp > 0 else "   -      -  "
         strike_str = f"{int(strike):>7}"
-
         messages.append(f"<code>{ce_str} ║ {strike_str} ║ {pe_str}</code>")
 
     messages.append("─" * 42)
 
-    # Summary
     if total_ce_oi > 0 or total_pe_oi > 0:
         pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
-
         messages.append(f"\n📊 <b>Open Interest:</b>")
         messages.append(f"   CALL: {total_ce_oi:>10,}")
         messages.append(f"   PUT:  {total_pe_oi:>10,}")
         messages.append(f"   <b>PCR: {pcr:.3f}</b>")
-
-        # PCR interpretation
         if pcr > 1.2:
             sentiment = "🟢 Bullish"
         elif pcr < 0.8:
@@ -441,7 +314,6 @@ def format_option_chain_message(index_name, spot_price, expiry, option_contracts
         messages.append(f"   PUT:  {total_pe_vol:>10,}")
 
     messages.append(f"\n🕐 {time.strftime('%H:%M:%S')}")
-
     return "\n".join(messages)
 
 def bot_loop():
@@ -450,7 +322,6 @@ def bot_loop():
         return
 
     try:
-        # Initialize DhanHQ
         dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
         logger.info("✅ DhanHQ initialized successfully!")
     except Exception as e:
@@ -463,7 +334,6 @@ def bot_loop():
                    f"⏱ Polling every {POLL_INTERVAL}s\n"
                    f"📊 Real-time OI + Volume enabled!")
 
-    # Download instruments once
     instruments = get_instruments(dhan)
     if not instruments:
         logger.error("❌ Failed to download instruments")
@@ -475,55 +345,45 @@ def bot_loop():
         try:
             iteration += 1
             logger.info(f"\n{'='*50}")
-            logger.info(f"🔄 Iteration #{iteration} - {time.strftime('%H:%M:%S')}")
+            logger.info(f"🔄 Iteration #{iteration} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info(f"{'='*50}")
 
-            # Process NIFTY
-            logger.info(f"\n--- Processing NIFTY ---")
+            # NIFTY
+            logger.info("--- Processing NIFTY ---")
             nifty_price = get_spot_price_dhan(dhan, 'NIFTY')
-
             if nifty_price and nifty_price > 0:
                 nifty_expiry = get_nifty_expiry()
-                nifty_options = find_option_contracts(instruments, 'NIFTY',
-                                                     nifty_expiry, nifty_price)
-
+                nifty_options = find_option_contracts(instruments, 'NIFTY', nifty_expiry, nifty_price)
                 if nifty_options:
                     market_data = get_option_chain_data(dhan, nifty_options)
                     if market_data:
-                        msg = format_option_chain_message('NIFTY 50', nifty_price,
-                                                         nifty_expiry, nifty_options,
-                                                         market_data)
+                        msg = format_option_chain_message('NIFTY 50', nifty_price, nifty_expiry, nifty_options, market_data)
                         tele_send_http(TELE_CHAT_ID, msg)
                         logger.info("✅ NIFTY data sent to Telegram")
                         time.sleep(2)
 
-            # Process BANKNIFTY
-            logger.info(f"\n--- Processing BANKNIFTY ---")
+            # BANKNIFTY
+            logger.info("--- Processing BANKNIFTY ---")
             bn_price = get_spot_price_dhan(dhan, 'BANKNIFTY')
-
             if bn_price and bn_price > 0:
                 bn_expiry = get_banknifty_expiry()
-                bn_options = find_option_contracts(instruments, 'BANKNIFTY',
-                                                  bn_expiry, bn_price)
-
+                bn_options = find_option_contracts(instruments, 'BANKNIFTY', bn_expiry, bn_price)
                 if bn_options:
                     market_data = get_option_chain_data(dhan, bn_options)
                     if market_data:
-                        msg = format_option_chain_message('BANK NIFTY', bn_price,
-                                                         bn_expiry, bn_options,
-                                                         market_data)
+                        msg = format_option_chain_message('BANK NIFTY', bn_price, bn_expiry, bn_options, market_data)
                         tele_send_http(TELE_CHAT_ID, msg)
                         logger.info("✅ BANKNIFTY data sent to Telegram")
 
-            logger.info(f"✅ Iteration #{iteration} complete. Sleeping {POLL_INTERVAL}s...")
+            logger.info("✅ Iteration #%d complete. Sleeping %ds...", iteration, POLL_INTERVAL)
 
         except Exception as e:
-            logger.exception(f"❌ Error in bot loop iteration #{iteration}: {e}")
+            logger.exception("❌ Error in bot loop iteration #%d: %s", iteration, e)
             tele_send_http(TELE_CHAT_ID, f"⚠️ Error #{iteration}: {str(e)[:200]}")
 
         time.sleep(POLL_INTERVAL)
 
-# Start bot in background thread
+# start background thread
 thread = threading.Thread(target=bot_loop, daemon=True)
 thread.start()
 
@@ -533,7 +393,7 @@ def index():
         'bot_thread_alive': thread.is_alive(),
         'poll_interval': POLL_INTERVAL,
         'service': 'DhanHQ Option Chain Bot v2.0',
-        'features': ['Real-time OI', 'Volume', 'PCR Analysis'],
+        'features': ['Index Options (OPTIDX)', 'Real-time OI', 'Volume', 'PCR Analysis'],
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     }
     return jsonify(status)
