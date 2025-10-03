@@ -71,7 +71,7 @@ def get_instruments(dhan):
         logger.info("📥 Fetching instruments from DhanHQ...")
         
         # Get instruments for F&O segment
-        response = dhan.get_security_list(exchange_segment=FNO)
+        response = dhan.fetch_security_list(exchange_segment=FNO)
         
         if response and response.get('status') == 'success':
             instruments = response.get('data', [])
