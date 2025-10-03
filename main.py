@@ -21,6 +21,10 @@ REQUIRED = [DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELE_TOKEN, TELE_CHAT_ID]
 
 app = Flask(__name__)
 
+# Exchange segment constants for DhanHQ 2.0+
+IDX = 1  # Index segment
+FNO = 2  # F&O segment
+
 def tele_send_http(chat_id: str, text: str):
     """Send message using Telegram Bot HTTP API"""
     try:
@@ -61,48 +65,42 @@ def get_banknifty_expiry():
     expiry = today + timedelta(days=days_ahead)
     return expiry.strftime('%Y-%m-%d')
 
-def get_option_chain_dhan(dhan, index_name, expiry_date):
-    """
-    Fetch option chain data from DhanHQ
-    index_name: 'NIFTY' or 'BANKNIFTY'
-    expiry_date: 'YYYY-MM-DD' format
-    """
+def get_instruments(dhan):
+    """Download instruments master file from DhanHQ"""
     try:
-        logger.info(f"📡 Fetching option chain for {index_name} expiry {expiry_date}")
+        logger.info("📥 Fetching instruments from DhanHQ...")
         
-        # DhanHQ security IDs for indices
-        # NIFTY 50 = 13, BANKNIFTY = 25
-        security_id = 13 if index_name == 'NIFTY' else 25
-        
-        # Fetch option chain
-        response = dhan.get_option_chain(security_id, expiry_date)
+        # Get instruments for F&O segment
+        response = dhan.get_security_list(exchange_segment=FNO)
         
         if response and response.get('status') == 'success':
-            data = response.get('data', {})
-            logger.info(f"✅ Option chain data received for {index_name}")
-            return data
+            instruments = response.get('data', [])
+            logger.info(f"✅ Downloaded {len(instruments)} F&O instruments")
+            return instruments
         else:
-            logger.error(f"Failed to fetch option chain: {response}")
-            return None
+            logger.error(f"Failed to get instruments: {response}")
+            return []
             
     except Exception as e:
-        logger.exception(f"❌ Error fetching option chain: {e}")
-        return None
+        logger.exception(f"❌ Error fetching instruments: {e}")
+        return []
 
 def get_spot_price_dhan(dhan, index_name):
     """Get spot price for NIFTY or BANKNIFTY"""
     try:
         # DhanHQ Index security IDs
-        security_id = 13 if index_name == 'NIFTY' else 25
+        # NIFTY 50 = 13, BANKNIFTY = 25
+        security_id = "13" if index_name == 'NIFTY' else "25"
         
-        # Fetch LTP
+        # Fetch LTP using quote API
         response = dhan.get_ltp_data(
-            exchange_segment=dhan.IDX,
-            security_id=str(security_id)
+            exchange_segment=IDX,
+            security_id=security_id
         )
         
         if response and response.get('status') == 'success':
-            ltp = response['data']['LTP']
+            data = response.get('data', {})
+            ltp = data.get('LTP', 0)
             logger.info(f"✅ {index_name} Spot: ₹{ltp:,.2f}")
             return ltp
         else:
@@ -113,11 +111,107 @@ def get_spot_price_dhan(dhan, index_name):
         logger.exception(f"❌ Error getting spot price: {e}")
         return None
 
+def find_option_contracts(instruments, index_name, expiry_date, spot_price):
+    """Find option contracts for strikes around spot price"""
+    try:
+        logger.info(f"🔍 Finding options for {index_name}, expiry: {expiry_date}")
+        
+        # Calculate strikes
+        if index_name == 'NIFTY':
+            strike_gap = 50
+            underlying = 'NIFTY'
+        else:
+            strike_gap = 100
+            underlying = 'BANKNIFTY'
+        
+        atm = round(spot_price / strike_gap) * strike_gap
+        strikes = []
+        for i in range(-5, 6):
+            strikes.append(atm + (i * strike_gap))
+        
+        logger.info(f"🎯 ATM: {atm}, Strikes: {min(strikes)} to {max(strikes)}")
+        
+        # Filter instruments
+        option_contracts = []
+        for inst in instruments:
+            if inst.get('SEM_TRADING_SYMBOL', '').startswith(underlying):
+                inst_expiry = inst.get('SEM_EXPIRY_DATE', '')
+                
+                # Match expiry date (format: DD-MMM-YYYY)
+                if inst_expiry:
+                    try:
+                        exp_dt = datetime.strptime(inst_expiry, '%d-%b-%Y')
+                        target_dt = datetime.strptime(expiry_date, '%Y-%m-%d')
+                        
+                        if exp_dt.date() == target_dt.date():
+                            strike = float(inst.get('SEM_STRIKE_PRICE', 0))
+                            
+                            if strike in strikes:
+                                option_type = inst.get('SEM_OPTION_TYPE', '')
+                                security_id = inst.get('SEM_SMST_SECURITY_ID')
+                                
+                                option_contracts.append({
+                                    'strike': strike,
+                                    'type': option_type,  # 'CE' or 'PE'
+                                    'security_id': security_id,
+                                    'symbol': inst.get('SEM_TRADING_SYMBOL'),
+                                    'expiry': inst_expiry
+                                })
+                    except:
+                        continue
+        
+        logger.info(f"✅ Found {len(option_contracts)} option contracts")
+        return sorted(option_contracts, key=lambda x: (x['strike'], x['type']))
+        
+    except Exception as e:
+        logger.exception(f"❌ Error finding option contracts: {e}")
+        return []
+
+def get_option_chain_data(dhan, option_contracts):
+    """Fetch option chain data with OI and Volume"""
+    try:
+        if not option_contracts:
+            return {}
+        
+        logger.info(f"📡 Fetching data for {len(option_contracts)} options...")
+        
+        # Prepare security IDs for batch quote
+        security_ids = [str(opt['security_id']) for opt in option_contracts]
+        
+        # Fetch market quotes
+        response = dhan.get_market_quote(
+            exchange_segment=FNO,
+            security_id=','.join(security_ids[:50])  # API limit: 50 at a time
+        )
+        
+        if response and response.get('status') == 'success':
+            data = response.get('data', {})
+            logger.info(f"✅ Market data received")
+            
+            result = {}
+            for quote in data.values():
+                sec_id = str(quote.get('security_id'))
+                result[sec_id] = {
+                    'ltp': float(quote.get('LTP', 0)),
+                    'oi': int(quote.get('open_interest', 0)),
+                    'volume': int(quote.get('volume', 0)),
+                    'change': float(quote.get('change', 0))
+                }
+            
+            return result
+        else:
+            logger.error(f"Failed to get market quotes: {response}")
+            return {}
+            
+    except Exception as e:
+        logger.exception(f"❌ Error fetching option data: {e}")
+        return {}
+
 def calculate_strikes(spot_price, index_name, num_strikes=5):
     """Calculate ATM and surrounding strikes"""
     if index_name == 'NIFTY':
         strike_gap = 50
-    else:  # BANKNIFTY
+    else:
         strike_gap = 100
     
     atm = round(spot_price / strike_gap) * strike_gap
@@ -128,7 +222,7 @@ def calculate_strikes(spot_price, index_name, num_strikes=5):
     
     return sorted(strikes)
 
-def format_option_chain_message(index_name, spot_price, expiry, option_data):
+def format_option_chain_message(index_name, spot_price, expiry, option_contracts, market_data):
     """Format option chain data for Telegram with OI and Volume"""
     messages = []
     messages.append(f"📊 <b>{index_name}</b>")
@@ -139,36 +233,41 @@ def format_option_chain_message(index_name, spot_price, expiry, option_data):
     messages.append("<code>  LTP    OI  ║  Price  ║  LTP    OI </code>")
     messages.append("─" * 42)
     
-    # Calculate strikes to display
-    strikes = calculate_strikes(spot_price, index_name)
+    # Group by strike
+    strikes = {}
+    for opt in option_contracts:
+        strike = opt['strike']
+        if strike not in strikes:
+            strikes[strike] = {'CE': None, 'PE': None}
+        
+        sec_id = str(opt['security_id'])
+        data = market_data.get(sec_id, {})
+        
+        strikes[strike][opt['type']] = data
     
     total_ce_oi = 0
     total_pe_oi = 0
     total_ce_vol = 0
     total_pe_vol = 0
     
-    for strike in strikes:
-        # Find CE and PE data for this strike
-        ce_data = next((opt for opt in option_data.get('call', []) 
-                       if opt.get('strike_price') == strike), None)
-        pe_data = next((opt for opt in option_data.get('put', []) 
-                       if opt.get('strike_price') == strike), None)
+    for strike in sorted(strikes.keys()):
+        ce_data = strikes[strike].get('CE', {}) or {}
+        pe_data = strikes[strike].get('PE', {}) or {}
         
-        # Extract values
-        ce_ltp = ce_data.get('ltp', 0) if ce_data else 0
-        ce_oi = ce_data.get('open_interest', 0) if ce_data else 0
-        ce_vol = ce_data.get('volume', 0) if ce_data else 0
+        ce_ltp = ce_data.get('ltp', 0)
+        ce_oi = ce_data.get('oi', 0)
+        ce_vol = ce_data.get('volume', 0)
         
-        pe_ltp = pe_data.get('ltp', 0) if pe_data else 0
-        pe_oi = pe_data.get('open_interest', 0) if pe_data else 0
-        pe_vol = pe_data.get('volume', 0) if pe_data else 0
+        pe_ltp = pe_data.get('ltp', 0)
+        pe_oi = pe_data.get('oi', 0)
+        pe_vol = pe_data.get('volume', 0)
         
         total_ce_oi += ce_oi
         total_pe_oi += pe_oi
         total_ce_vol += ce_vol
         total_pe_vol += pe_vol
         
-        # Format OI in K (thousands)
+        # Format OI in K
         ce_oi_str = f"{ce_oi//1000}K" if ce_oi >= 1000 else f"{ce_oi}"
         pe_oi_str = f"{pe_oi//1000}K" if pe_oi >= 1000 else f"{pe_oi}"
         
@@ -181,7 +280,7 @@ def format_option_chain_message(index_name, spot_price, expiry, option_data):
     
     messages.append("─" * 42)
     
-    # Summary with PCR
+    # Summary
     if total_ce_oi > 0 or total_pe_oi > 0:
         pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
         
@@ -225,7 +324,14 @@ def bot_loop():
     tele_send_http(TELE_CHAT_ID, 
                    f"✅ DhanHQ Option Chain Bot started!\n"
                    f"⏱ Polling every {POLL_INTERVAL}s\n"
-                   f"📊 Real-time OI + Volume data enabled!")
+                   f"📊 Real-time OI + Volume enabled!")
+    
+    # Download instruments once
+    instruments = get_instruments(dhan)
+    if not instruments:
+        logger.error("❌ Failed to download instruments")
+        tele_send_http(TELE_CHAT_ID, "❌ Failed to load instruments")
+        return
     
     iteration = 0
     while True:
@@ -239,34 +345,38 @@ def bot_loop():
             logger.info(f"\n--- Processing NIFTY ---")
             nifty_price = get_spot_price_dhan(dhan, 'NIFTY')
             
-            if nifty_price:
+            if nifty_price and nifty_price > 0:
                 nifty_expiry = get_nifty_expiry()
-                nifty_chain = get_option_chain_dhan(dhan, 'NIFTY', nifty_expiry)
+                nifty_options = find_option_contracts(instruments, 'NIFTY', 
+                                                     nifty_expiry, nifty_price)
                 
-                if nifty_chain:
-                    msg = format_option_chain_message('NIFTY 50', nifty_price, 
-                                                     nifty_expiry, nifty_chain)
-                    tele_send_http(TELE_CHAT_ID, msg)
-                    logger.info("✅ NIFTY data sent to Telegram")
-                    time.sleep(2)
-                else:
-                    logger.warning("⚠️ No NIFTY option chain data")
+                if nifty_options:
+                    market_data = get_option_chain_data(dhan, nifty_options)
+                    if market_data:
+                        msg = format_option_chain_message('NIFTY 50', nifty_price, 
+                                                         nifty_expiry, nifty_options, 
+                                                         market_data)
+                        tele_send_http(TELE_CHAT_ID, msg)
+                        logger.info("✅ NIFTY data sent to Telegram")
+                        time.sleep(2)
             
             # Process BANKNIFTY
             logger.info(f"\n--- Processing BANKNIFTY ---")
             bn_price = get_spot_price_dhan(dhan, 'BANKNIFTY')
             
-            if bn_price:
+            if bn_price and bn_price > 0:
                 bn_expiry = get_banknifty_expiry()
-                bn_chain = get_option_chain_dhan(dhan, 'BANKNIFTY', bn_expiry)
+                bn_options = find_option_contracts(instruments, 'BANKNIFTY', 
+                                                  bn_expiry, bn_price)
                 
-                if bn_chain:
-                    msg = format_option_chain_message('BANK NIFTY', bn_price, 
-                                                     bn_expiry, bn_chain)
-                    tele_send_http(TELE_CHAT_ID, msg)
-                    logger.info("✅ BANKNIFTY data sent to Telegram")
-                else:
-                    logger.warning("⚠️ No BANKNIFTY option chain data")
+                if bn_options:
+                    market_data = get_option_chain_data(dhan, bn_options)
+                    if market_data:
+                        msg = format_option_chain_message('BANK NIFTY', bn_price, 
+                                                         bn_expiry, bn_options, 
+                                                         market_data)
+                        tele_send_http(TELE_CHAT_ID, msg)
+                        logger.info("✅ BANKNIFTY data sent to Telegram")
             
             logger.info(f"✅ Iteration #{iteration} complete. Sleeping {POLL_INTERVAL}s...")
             
@@ -285,7 +395,7 @@ def index():
     status = {
         'bot_thread_alive': thread.is_alive(),
         'poll_interval': POLL_INTERVAL,
-        'service': 'DhanHQ Option Chain Bot',
+        'service': 'DhanHQ Option Chain Bot v2.0',
         'features': ['Real-time OI', 'Volume', 'PCR Analysis'],
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     }
