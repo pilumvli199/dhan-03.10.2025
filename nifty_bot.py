@@ -126,7 +126,7 @@ class NiftyLTPBot:
             return None
     
     def get_historical_data(self, days=5):
-        """Historical data घेतो (last N days)"""
+        """Historical data - Fixed method"""
         try:
             to_date = datetime.now().strftime("%Y-%m-%d")
             from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -136,6 +136,7 @@ class NiftyLTPBot:
                 "exchangeSegment": NIFTY_SEGMENT,
                 "instrument": "INDEX",
                 "expiryCode": 0,
+                "oi": False,
                 "fromDate": from_date,
                 "toDate": to_date
             }
@@ -144,29 +145,51 @@ class NiftyLTPBot:
                 DHAN_HISTORICAL_URL,
                 json=payload,
                 headers=self.headers,
-                timeout=10
+                timeout=15
             )
+            
+            logger.info(f"Historical API Status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
-                if 'data' in data and len(data['data']) > 0:
-                    logger.info(f"Historical data fetched: {len(data['data'])} days")
-                    return data['data']
+                logger.info(f"Historical Response: {data}")
+                
+                # Parse array format response
+                if 'open' in data and 'close' in data:
+                    timestamps = data.get('timestamp', [])
+                    opens = data.get('open', [])
+                    highs = data.get('high', [])
+                    lows = data.get('low', [])
+                    closes = data.get('close', [])
+                    volumes = data.get('volume', [])
+                    
+                    parsed_data = []
+                    for i in range(len(timestamps)):
+                        parsed_data.append({
+                            'date': datetime.fromtimestamp(timestamps[i]).strftime('%Y-%m-%d'),
+                            'open': opens[i] if i < len(opens) else 0,
+                            'high': highs[i] if i < len(highs) else 0,
+                            'low': lows[i] if i < len(lows) else 0,
+                            'close': closes[i] if i < len(closes) else 0,
+                            'volume': volumes[i] if i < len(volumes) else 0
+                        })
+                    
+                    logger.info(f"Historical data parsed: {len(parsed_data)} days")
+                    return parsed_data[-5:]  # Last 5 days
             
             return None
             
         except Exception as e:
-            logger.error(f"Error getting historical data: {e}")
+            logger.error(f"Error getting historical: {e}")
             return None
     
     def get_option_chain_with_greeks(self):
-        """Option Chain data with Greeks घेतो"""
+        """Option Chain with Greeks & Volume"""
         try:
             if not self.current_expiry:
                 self.get_nearest_expiry()
             
             if not self.current_expiry:
-                logger.warning("No expiry date found")
                 return None
             
             payload = {
@@ -192,19 +215,15 @@ class NiftyLTPBot:
                     if not oc_data:
                         return None
                     
-                    # Get all strikes and sort
                     strikes = sorted([float(s) for s in oc_data.keys()])
-                    
-                    # Find ATM
                     atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
                     atm_index = strikes.index(atm_strike)
                     
-                    # Get 5 strikes around ATM
+                    # 5 strikes around ATM
                     start_idx = max(0, atm_index - 5)
                     end_idx = min(len(strikes), atm_index + 6)
                     selected_strikes = strikes[start_idx:end_idx]
                     
-                    # Extract full data with Greeks
                     option_data = []
                     for strike in selected_strikes:
                         strike_key = f"{strike:.6f}"
@@ -212,8 +231,6 @@ class NiftyLTPBot:
                         
                         ce_data = strike_data.get('ce', {})
                         pe_data = strike_data.get('pe', {})
-                        
-                        # Extract Greeks
                         ce_greeks = ce_data.get('greeks', {})
                         pe_greeks = pe_data.get('greeks', {})
                         
@@ -238,7 +255,7 @@ class NiftyLTPBot:
                             'is_atm': (strike == atm_strike)
                         })
                     
-                    logger.info(f"Option Chain with Greeks fetched: {len(option_data)} strikes")
+                    logger.info(f"Option Chain fetched: {len(option_data)} strikes")
                     return {
                         'spot': spot_price,
                         'atm': atm_strike,
@@ -249,11 +266,11 @@ class NiftyLTPBot:
             return None
             
         except Exception as e:
-            logger.error(f"Error getting option chain: {e}")
+            logger.error(f"Error option chain: {e}")
             return None
     
     async def send_option_chain_message(self, option_data):
-        """Option Chain with basic data"""
+        """Option Chain with LTP, OI & Volume"""
         try:
             message = f"📊 *OPTION CHAIN*\n"
             message += f"📅 Expiry: {option_data['expiry']}\n"
@@ -261,17 +278,21 @@ class NiftyLTPBot:
             message += f"🎯 ATM: ₹{option_data['atm']:,.0f}\n\n"
             
             message += "```\n"
-            message += "Strike   CE-LTP  CE-OI    PE-LTP  PE-OI\n"
-            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            message += "Strike   CE-LTP  CE-OI  CE-Vol  PE-LTP  PE-OI  PE-Vol\n"
+            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             
             for opt in option_data['options']:
-                atm_mark = "🔸" if opt['is_atm'] else "  "
+                atm = "🔸" if opt['is_atm'] else "  "
+                
                 ce_ltp = f"{opt['ce_ltp']:6.1f}" if opt['ce_ltp'] > 0 else "  -   "
                 ce_oi = f"{opt['ce_oi']/1000:5.0f}K" if opt['ce_oi'] > 0 else "  -  "
+                ce_vol = f"{opt['ce_volume']/1000:5.0f}K" if opt['ce_volume'] > 0 else "  -  "
+                
                 pe_ltp = f"{opt['pe_ltp']:6.1f}" if opt['pe_ltp'] > 0 else "  -   "
                 pe_oi = f"{opt['pe_oi']/1000:5.0f}K" if opt['pe_oi'] > 0 else "  -  "
+                pe_vol = f"{opt['pe_volume']/1000:5.0f}K" if opt['pe_volume'] > 0 else "  -  "
                 
-                message += f"{atm_mark}{opt['strike']:5.0f} {ce_ltp} {ce_oi}  {pe_ltp} {pe_oi}\n"
+                message += f"{atm}{opt['strike']:5.0f} {ce_ltp} {ce_oi} {ce_vol}  {pe_ltp} {pe_oi} {pe_vol}\n"
             
             message += "```"
             
@@ -280,65 +301,55 @@ class NiftyLTPBot:
                 text=message,
                 parse_mode='Markdown'
             )
-            logger.info("Option chain message sent")
+            logger.info("Option chain sent")
             
         except Exception as e:
-            logger.error(f"Error sending option chain: {e}")
+            logger.error(f"Error sending OC: {e}")
     
     async def send_greeks_message(self, option_data):
-        """Greeks data (Delta, Theta, Gamma)"""
+        """Greeks for ATM"""
         try:
-            # Find ATM option
-            atm_option = next((opt for opt in option_data['options'] if opt['is_atm']), None)
-            
-            if not atm_option:
+            atm_opt = next((o for o in option_data['options'] if o['is_atm']), None)
+            if not atm_opt:
                 return
             
-            message = f"🎲 *GREEKS - ATM Strike {atm_option['strike']:.0f}*\n\n"
-            
+            message = f"🎲 *GREEKS - ATM {atm_opt['strike']:.0f}*\n\n"
             message += "```\n"
-            message += "         CALL              PUT\n"
-            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            message += f"Delta:  {atm_option['ce_delta']:7.4f}      {atm_option['pe_delta']:7.4f}\n"
-            message += f"Theta:  {atm_option['ce_theta']:7.2f}      {atm_option['pe_theta']:7.2f}\n"
-            message += f"Gamma:  {atm_option['ce_gamma']:7.5f}      {atm_option['pe_gamma']:7.5f}\n"
-            message += f"Vega:   {atm_option['ce_vega']:7.2f}      {atm_option['pe_vega']:7.2f}\n"
-            message += f"IV:     {atm_option['ce_iv']:7.2f}%     {atm_option['pe_iv']:7.2f}%\n"
-            message += "```\n\n"
-            
-            message += "📝 *Greek Meanings:*\n"
-            message += "• Delta: Price change per ₹1 move\n"
-            message += "• Theta: Time decay per day\n"
-            message += "• Gamma: Delta change rate\n"
-            message += "• Vega: IV sensitivity\n"
+            message += "         CALL         PUT\n"
+            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            message += f"Delta:  {atm_opt['ce_delta']:7.4f}   {atm_opt['pe_delta']:7.4f}\n"
+            message += f"Theta:  {atm_opt['ce_theta']:7.2f}   {atm_opt['pe_theta']:7.2f}\n"
+            message += f"Gamma:  {atm_opt['ce_gamma']:7.5f}   {atm_opt['pe_gamma']:7.5f}\n"
+            message += f"Vega:   {atm_opt['ce_vega']:7.2f}   {atm_opt['pe_vega']:7.2f}\n"
+            message += f"IV:     {atm_opt['ce_iv']:6.2f}%   {atm_opt['pe_iv']:6.2f}%\n"
+            message += "```"
             
             await self.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=message,
                 parse_mode='Markdown'
             )
-            logger.info("Greeks message sent")
+            logger.info("Greeks sent")
             
         except Exception as e:
-            logger.error(f"Error sending Greeks: {e}")
+            logger.error(f"Error Greeks: {e}")
     
-    async def send_historical_message(self, historical_data):
-        """Historical data message (last 5 days)"""
+    async def send_historical_message(self, hist_data):
+        """Historical OHLC"""
         try:
-            message = f"📈 *HISTORICAL DATA (Last 5 Days)*\n\n"
+            if not hist_data:
+                return
             
+            message = f"📈 *HISTORICAL DATA (Last {len(hist_data)} Days)*\n\n"
             message += "```\n"
-            message += "Date       Open    High     Low   Close\n"
-            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            message += "Date         Open     High      Low    Close     Vol\n"
+            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             
-            for day in historical_data[-5:]:
-                date = day.get('timestamp', '')[:10]
-                open_p = day.get('open', 0)
-                high = day.get('high', 0)
-                low = day.get('low', 0)
-                close = day.get('close', 0)
-                
-                message += f"{date} {open_p:7.2f} {high:7.2f} {low:6.2f} {close:7.2f}\n"
+            for day in hist_data:
+                date = day['date']
+                message += f"{date} {day['open']:7.2f} {day['high']:7.2f} "
+                message += f"{day['low']:7.2f} {day['close']:7.2f} "
+                message += f"{day['volume']/1000000:5.1f}M\n"
             
             message += "```"
             
@@ -347,82 +358,81 @@ class NiftyLTPBot:
                 text=message,
                 parse_mode='Markdown'
             )
-            logger.info("Historical data sent")
+            logger.info("Historical sent")
             
         except Exception as e:
-            logger.error(f"Error sending historical: {e}")
+            logger.error(f"Error historical: {e}")
     
-    async def send_nifty_ltp_message(self, data):
-        """Quick Nifty LTP update"""
+    async def send_nifty_ltp(self, data):
+        """Quick LTP"""
         try:
-            change_emoji = "🟢" if data['change'] >= 0 else "🔴"
-            change_sign = "+" if data['change'] >= 0 else ""
+            emoji = "🟢" if data['change'] >= 0 else "🔴"
+            sign = "+" if data['change'] >= 0 else ""
             
-            message = f"📊 *NIFTY 50*\n"
-            message += f"💰 {data['ltp']:,.2f} "
-            message += f"{change_emoji} {change_sign}{data['change']:,.2f} ({change_sign}{data['change_pct']:.2f}%)"
+            msg = f"📊 *NIFTY 50*\n"
+            msg += f"💰 {data['ltp']:,.2f} {emoji} {sign}{data['change']:,.2f} ({sign}{data['change_pct']:.2f}%)"
             
             await self.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=message,
+                text=msg,
                 parse_mode='Markdown'
             )
             
         except Exception as e:
-            logger.error(f"Error sending LTP: {e}")
+            logger.error(f"Error LTP: {e}")
     
     async def run(self):
-        """Main loop"""
+        """Main loop with rate limit handling"""
         logger.info("🚀 Bot started!")
         
         await self.send_startup_message()
         
-        # Get expiry
+        # Initial setup
         self.get_nearest_expiry()
         
-        # Send historical data once at start
-        hist_data = self.get_historical_data(5)
-        if hist_data:
-            await self.send_historical_message(hist_data)
+        # Historical data once at start
+        await asyncio.sleep(2)
+        hist = self.get_historical_data(5)
+        if hist:
+            await self.send_historical_message(hist)
         
         iteration = 0
         
         while self.running:
             try:
-                # Nifty LTP - every minute
-                nifty_data = self.get_nifty_ltp()
-                if nifty_data:
-                    await self.send_nifty_ltp_message(nifty_data)
+                # LTP every minute
+                nifty = self.get_nifty_ltp()
+                if nifty:
+                    await self.send_nifty_ltp(nifty)
                 
-                # Option Chain - every 3 minutes
-                if iteration % 3 == 0:
-                    option_data = self.get_option_chain_with_greeks()
-                    if option_data:
-                        await self.send_option_chain_message(option_data)
-                        await asyncio.sleep(2)  # Small delay
-                        await self.send_greeks_message(option_data)
-                    
-                    await asyncio.sleep(3)  # API rate limit
+                # Option Chain every 5 minutes (rate limit compliance)
+                if iteration % 5 == 0:
+                    await asyncio.sleep(3)  # Rate limit: 1 req/3 sec
+                    oc = self.get_option_chain_with_greeks()
+                    if oc:
+                        await self.send_option_chain_message(oc)
+                        await asyncio.sleep(2)
+                        await self.send_greeks_message(oc)
                 
                 iteration += 1
-                await asyncio.sleep(60)
+                await asyncio.sleep(60)  # 1 minute
                 
             except KeyboardInterrupt:
-                logger.info("Bot stopped")
                 self.running = False
                 break
             except Exception as e:
-                logger.error(f"Error in loop: {e}")
+                logger.error(f"Loop error: {e}")
                 await asyncio.sleep(60)
     
     async def send_startup_message(self):
         """Startup"""
         try:
-            msg = "🤖 *Nifty Pro Bot Started!*\n\n"
-            msg += "✅ Live LTP - Every minute\n"
-            msg += "✅ Option Chain - Every 3 min\n"
-            msg += "✅ Greeks (Delta/Theta/Gamma)\n"
+            msg = "🤖 *Nifty Pro Bot v2*\n\n"
+            msg += "✅ Live LTP - Every 1 min\n"
+            msg += "✅ Option Chain (with Volume) - Every 5 min\n"
+            msg += "✅ Greeks (Δ Θ Γ V)\n"
             msg += "✅ Historical Data (5 days)\n\n"
+            msg += "⚡ Rate limit optimized\n"
             msg += "🚂 Railway.app"
             
             await self.bot.send_message(
@@ -431,17 +441,17 @@ class NiftyLTPBot:
                 parse_mode='Markdown'
             )
         except Exception as e:
-            logger.error(f"Startup error: {e}")
+            logger.error(f"Startup: {e}")
 
 
 if __name__ == "__main__":
     try:
         if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN]):
-            logger.error("❌ Missing environment variables!")
+            logger.error("❌ Missing env vars!")
             exit(1)
         
         bot = NiftyLTPBot()
         asyncio.run(bot.run())
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal: {e}")
         exit(1)
