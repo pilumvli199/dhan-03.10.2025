@@ -43,7 +43,7 @@ STOCKS_INDICES = {
     "SENSEX": {"symbol": "SENSEX", "segment": "IDX_I", "type": "index"},
     "FINNIFTY": {"symbol": "FINNIFTY", "segment": "IDX_I", "type": "index"},
     
-    # High Volume Stocks (Monthly Expiry - 10 days before scan)
+    # High Volume Stocks (Monthly Expiry - 20 days before scan)
     "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ", "type": "stock"},
     "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ", "type": "stock"},
     "ICICIBANK": {"symbol": "ICICIBANK", "segment": "NSE_EQ", "type": "stock"},
@@ -267,18 +267,18 @@ class AIOptionTradingBot:
                 selected = future_expiries[0]
                 logger.info(f"📅 {symbol}: Weekly expiry selected: {selected}")
             else:
-                # Stock: Monthly expiry (10 days before)
+                # Stock: Monthly expiry (20 days before)
                 for expiry in future_expiries:
                     days_to_expiry = (expiry - today).days
                     
-                    # Check if within 10 days window
-                    if 0 <= days_to_expiry <= 10:
+                    # Check if within 20 days window
+                    if 0 <= days_to_expiry <= 20:
                         selected = expiry
-                        logger.info(f"📅 {symbol}: Within 10-day window! Expiry: {selected} ({days_to_expiry} days)")
+                        logger.info(f"📅 {symbol}: Within 20-day window! Expiry: {selected} ({days_to_expiry} days)")
                         break
                 else:
                     # No expiry in window, skip this stock
-                    logger.info(f"⏭️ {symbol}: No expiry within 10 days. Skipping...")
+                    logger.info(f"⏭️ {symbol}: No expiry within 20 days. Skipping...")
                     return None
             
             return selected.strftime('%Y-%m-%d')
@@ -707,12 +707,12 @@ class AIOptionTradingBot:
                 
                 logger.info(f"📊 Analyzing {symbol} ({symbol_type})...")
                 
-                # 🆕 Update expiry (auto-rollover + 10-day window for stocks)
+                # 🆕 Update expiry (auto-rollover + 20-day window for stocks)
                 expiry = self.update_expiry_for_symbol(symbol, security_id, segment, symbol_type)
                 
                 if not expiry:
                     if symbol_type == 'stock':
-                        logger.info(f"⏭️ {symbol}: Skipping (no expiry in 10-day window)")
+                        logger.info(f"⏭️ {symbol}: Skipping (no expiry in 20-day window)")
                     continue
                 
                 # 🆕 Multi-timeframe data
@@ -795,38 +795,24 @@ class AIOptionTradingBot:
         
         logger.info(f"📊 {len(indices)} Indices | {len(stocks)} Stocks")
         
-        cycle_count = 0
+        # 🆕 IMMEDIATE FIRST SCAN (No expiry wait!)
+        logger.info("🔥 IMMEDIATE SCAN: Starting first analysis cycle...")
+        await self.perform_analysis_cycle(indices, stocks, cycle_num=1)
+        logger.info("✅ Initial scan completed!")
+        
+        cycle_count = 1
         
         while self.running:
             try:
                 cycle_count += 1
+                
+                logger.info(f"⏳ Waiting 5 minutes before next cycle...")
+                await asyncio.sleep(300)
+                
                 timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
                 logger.info(f"🔄 Cycle #{cycle_count} started at {timestamp}")
                 
-                # Analyze indices (every cycle)
-                if indices:
-                    logger.info(f"📊 Analyzing {len(indices)} indices...")
-                    await self.analyze_and_send_signals(indices)
-                    await asyncio.sleep(5)
-                
-                # Analyze stocks (batch processing)
-                if stocks:
-                    logger.info(f"📈 Scanning {len(stocks)} stocks (10-day expiry window)...")
-                    
-                    batch_size = 5
-                    stock_batches = [stocks[i:i+batch_size] for i in range(0, len(stocks), batch_size)]
-                    
-                    for batch_num, batch in enumerate(stock_batches, 1):
-                        logger.info(f"📦 Stock Batch {batch_num}/{len(stock_batches)}: {batch}")
-                        await self.analyze_and_send_signals(batch)
-                        
-                        if batch_num < len(stock_batches):
-                            await asyncio.sleep(10)
-                
-                logger.info(f"✅ Cycle #{cycle_count} completed!")
-                logger.info("⏳ Next cycle in 5 minutes...")
-                
-                await asyncio.sleep(300)
+                await self.perform_analysis_cycle(indices, stocks, cycle_count)
                 
             except KeyboardInterrupt:
                 logger.info("🛑 Bot stopped by user")
@@ -835,6 +821,37 @@ class AIOptionTradingBot:
             except Exception as e:
                 logger.error(f"❌ Error in main loop: {e}")
                 await asyncio.sleep(60)
+    
+    async def perform_analysis_cycle(self, indices, stocks, cycle_num):
+        """
+        🆕 Separate function for analysis cycle (reusable for immediate scan)
+        """
+        try:
+            # Analyze indices (every cycle)
+            if indices:
+                logger.info(f"📊 Analyzing {len(indices)} indices...")
+                await self.analyze_and_send_signals(indices)
+                await asyncio.sleep(5)
+            
+            # Analyze stocks (batch processing)
+            if stocks:
+                logger.info(f"📈 Scanning {len(stocks)} stocks (20-day expiry window)...")
+                
+                batch_size = 5
+                stock_batches = [stocks[i:i+batch_size] for i in range(0, len(stocks), batch_size)]
+                
+                for batch_num, batch in enumerate(stock_batches, 1):
+                    logger.info(f"📦 Stock Batch {batch_num}/{len(stock_batches)}: {batch}")
+                    await self.analyze_and_send_signals(batch)
+                    
+                    if batch_num < len(stock_batches):
+                        await asyncio.sleep(10)
+            
+            logger.info(f"✅ Cycle #{cycle_num} completed!")
+            
+        except Exception as e:
+            logger.error(f"❌ Error in analysis cycle: {e}")
+            raise
     
     async def send_startup_message(self):
         """
@@ -849,7 +866,7 @@ class AIOptionTradingBot:
             
             msg += "*📊 Coverage:*\n"
             msg += f"• {indices_count} Indices (Weekly expiry)\n"
-            msg += f"• {stocks_count} Stocks (Monthly expiry, 10-day window)\n\n"
+            msg += f"• {stocks_count} Stocks (Monthly expiry, 20-day window)\n\n"
             
             msg += "*🎯 Features:*\n"
             msg += "✅ Multi-Timeframe Analysis (5m, 15m, 1h)\n"
@@ -866,7 +883,7 @@ class AIOptionTradingBot:
             
             msg += "*📅 Expiry Logic:*\n"
             msg += "• Indices: Nearest weekly\n"
-            msg += "• Stocks: Monthly (10 days before)\n\n"
+            msg += "• Stocks: Monthly (20 days before)\n\n"
             
             msg += "⚠️ *Disclaimer:* Educational purposes only. Trade at your own risk.\n\n"
             msg += "_Market Hours: 9:15 AM - 3:30 PM (Mon-Fri)_"
