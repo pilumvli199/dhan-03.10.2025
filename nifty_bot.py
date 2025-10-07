@@ -55,6 +55,21 @@ STOCKS_INDICES = {
     "BAJFINANCE": {"symbol": "BAJFINANCE", "segment": "NSE_EQ", "type": "stock"},
     "INFY": {"symbol": "INFY", "segment": "NSE_EQ", "type": "stock"},
     "TATAMOTORS": {"symbol": "TATAMOTORS", "segment": "NSE_EQ", "type": "stock"},
+    "AXISBANK": {"symbol": "AXISBANK", "segment": "NSE_EQ", "type": "stock"},
+    "SBIN": {"symbol": "SBIN", "segment": "NSE_EQ", "type": "stock"},
+    "LTIM": {"symbol": "LTIM", "segment": "NSE_EQ", "type": "stock"},
+    "ADANIENT": {"symbol": "ADANIENT", "segment": "NSE_EQ", "type": "stock"},
+    "KOTAKBANK": {"symbol": "KOTAKBANK", "segment": "NSE_EQ", "type": "stock"},
+    "LT": {"symbol": "LT", "segment": "NSE_EQ", "type": "stock"},
+    "MARUTI": {"symbol": "MARUTI", "segment": "NSE_EQ", "type": "stock"},
+    "TECHM": {"symbol": "TECHM", "segment": "NSE_EQ", "type": "stock"},
+    "HINDUNILVR": {"symbol": "HINDUNILVR", "segment": "NSE_EQ", "type": "stock"},
+    "BHARTIARTL": {"symbol": "BHARTIARTL", "segment": "NSE_EQ", "type": "stock"},
+    "DRREDDY": {"symbol": "DRREDDY", "segment": "NSE_EQ", "type": "stock"},
+    "WIPRO": {"symbol": "WIPRO", "segment": "NSE_EQ", "type": "stock"},
+    "TRENT": {"symbol": "TRENT", "segment": "NSE_EQ", "type": "stock"},
+    "TITAN": {"symbol": "TITAN", "segment": "NSE_EQ", "type": "stock"},
+    "ASIANPAINT": {"symbol": "ASIANPAINT", "segment": "NSE_EQ", "type": "stock"},
 }
 
 class AIOptionTradingBot:
