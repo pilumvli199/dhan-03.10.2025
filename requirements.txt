@@ -1,3 +1,13 @@
+# Core Dependencies
 python-telegram-bot==20.7
 requests==2.31.0
-asyncio
+openai==1.12.0
+
+# Async Support
+asyncio==3.4.3
+
+# Utilities
+python-dotenv==1.0.0
+
+# Optional (for better logging)
+coloredlogs==15.0.1
