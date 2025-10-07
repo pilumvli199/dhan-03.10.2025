@@ -175,6 +175,8 @@ class AIOptionTradingBot:
                     "toDate": to_date
                 }
                 
+                logger.info(f"📡 Fetching {interval}min data - Payload: {payload}")
+                
                 response = requests.post(
                     DHAN_INTRADAY_URL,
                     json=payload,
@@ -182,15 +184,21 @@ class AIOptionTradingBot:
                     timeout=15
                 )
                 
+                logger.info(f"📦 {interval}min API Status: {response.status_code}")
+                
                 if response.status_code == 200:
                     data = response.json()
                     
-                    # Handle different response structures
+                    # Log response structure
                     if isinstance(data, dict):
+                        logger.info(f"📊 {interval}min Response keys: {data.keys()}")
+                        
                         if 'open' in data and isinstance(data['open'], list):
                             # Array format
                             candles = []
                             length = len(data['open'])
+                            logger.info(f"✅ {interval}min: Got {length} candles (array format)")
+                            
                             for i in range(length):
                                 candles.append({
                                     'open': data['open'][i],
@@ -202,14 +210,26 @@ class AIOptionTradingBot:
                                 })
                             multi_tf_data[f'{interval}min'] = candles[-limit:]
                         elif 'data' in data:
-                            multi_tf_data[f'{interval}min'] = data['data'][-limit:]
-                    
-                    await asyncio.sleep(0.5)  # Small delay between TF requests
+                            candles = data['data']
+                            logger.info(f"✅ {interval}min: Got {len(candles)} candles (data format)")
+                            multi_tf_data[f'{interval}min'] = candles[-limit:]
+                        else:
+                            logger.warning(f"⚠️ {interval}min: Unknown response format - {list(data.keys())[:3]}")
+                    else:
+                        logger.warning(f"⚠️ {interval}min: Response is not dict - Type: {type(data)}")
+                else:
+                    logger.error(f"❌ {interval}min API failed: {response.status_code} - {response.text[:200]}")
+                
+                await asyncio.sleep(0.5)  # Small delay between TF requests
+            
+            logger.info(f"📈 Multi-TF Summary: {len(multi_tf_data)}/3 timeframes loaded - {list(multi_tf_data.keys())}")
             
             return multi_tf_data if len(multi_tf_data) == 3 else None
             
         except Exception as e:
             logger.error(f"❌ Error getting multi-TF data: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
     
     def get_all_expiries(self, security_id, segment):
@@ -909,6 +929,10 @@ class AIOptionTradingBot:
         🆕 Separate function for analysis cycle (reusable for immediate scan)
         """
         try:
+            # 🆕 Market time check
+            if not self.is_market_hours():
+                logger.warning("⚠️ Market is CLOSED! Running in test mode with limited data...")
+            
             # Analyze indices (every cycle)
             if indices:
                 logger.info(f"📊 Analyzing {len(indices)} indices...")
@@ -934,6 +958,22 @@ class AIOptionTradingBot:
         except Exception as e:
             logger.error(f"❌ Error in analysis cycle: {e}")
             raise
+    
+    def is_market_hours(self):
+        """
+        🆕 Check if market is open (9:15 AM - 3:30 PM, Mon-Fri)
+        """
+        now = datetime.now()
+        
+        # Weekend check
+        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+            return False
+        
+        # Time check
+        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        
+        return market_open <= now <= market_close
     
     async def send_startup_message(self):
         """
