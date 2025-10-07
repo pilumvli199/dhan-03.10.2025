@@ -9,46 +9,41 @@ import json
 from openai import OpenAI
 from collections import deque
 
+# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# ========================
+# CONFIGURATION
+# ========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-AI_PROVIDER = os.getenv("AI_PROVIDER", "openai")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-if AI_PROVIDER == "groq":
-    from groq import Groq
-    ai_client = Groq(api_key=GROQ_API_KEY)
-    AI_MODEL = "llama-3.1-70b-versatile"
-    logger.info("Using Groq")
-else:
-    ai_client = OpenAI(api_key=OPENAI_API_KEY)
-    AI_MODEL = "gpt-4o-mini"
-    logger.info("Using OpenAI")
+# OpenAI Client
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Dhan API URLs
 DHAN_API_BASE = "https://api.dhan.co"
 DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v2/charts/intraday"
 DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
 DHAN_EXPIRY_LIST_URL = f"{DHAN_API_BASE}/v2/optionchain/expirylist"
 DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
-CANDLES_TO_FETCH = 200
-TECHNICAL_LOOKBACK = 50
-ATR_PERIOD = 30
-AI_CANDLES_COUNT = 30
-
+# Stock/Index List
 STOCKS_INDICES = {
-    "NIFTY": {"symbol": "NIFTY 50", "segment": "IDX_I", "type": "index"},
-    "BANKNIFTY": {"symbol": "NIFTY BANK", "segment": "IDX_I", "type": "index"},
+    # Indices (Weekly Expiry Focus)
+    "NIFTY 50": {"symbol": "Nifty 50", "segment": "IDX_I", "type": "index"},
+    "NIFTY BANK": {"symbol": "Nifty Bank", "segment": "IDX_I", "type": "index"},
     "SENSEX": {"symbol": "SENSEX", "segment": "IDX_I", "type": "index"},
     "FINNIFTY": {"symbol": "FINNIFTY", "segment": "IDX_I", "type": "index"},
+    
+    # High Volume Stocks (Monthly Expiry)
     "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ", "type": "stock"},
     "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ", "type": "stock"},
     "ICICIBANK": {"symbol": "ICICIBANK", "segment": "NSE_EQ", "type": "stock"},
@@ -72,6 +67,10 @@ STOCKS_INDICES = {
     "ASIANPAINT": {"symbol": "ASIANPAINT", "segment": "NSE_EQ", "type": "stock"},
 }
 
+# ========================
+# AI OPTION BOT
+# ========================
+
 class AIOptionTradingBot:
     def __init__(self):
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -86,11 +85,12 @@ class AIOptionTradingBot:
         self.expiry_map = {}
         self.oi_history = {}
         self.last_option_chain_call = 0
-        logger.info("Bot initialized")
+        logger.info("🚀 Advanced AI Option Trading Bot initialized")
     
     async def load_security_ids(self):
+        """Load security IDs from Dhan"""
         try:
-            logger.info("Loading security IDs...")
+            logger.info("📥 Loading security IDs from Dhan...")
             response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
             
             if response.status_code == 200:
@@ -103,6 +103,7 @@ class AIOptionTradingBot:
                     
                     for row in reader:
                         try:
+                            # Index
                             if segment == "IDX_I":
                                 if (row.get('SEM_SEGMENT') == 'I' and 
                                     row.get('SEM_TRADING_SYMBOL') == symbol_name):
@@ -114,8 +115,9 @@ class AIOptionTradingBot:
                                             'trading_symbol': symbol_name,
                                             'type': info['type']
                                         }
-                                        logger.info(f"{symbol}: {sec_id}")
+                                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
                                         break
+                            # Stock
                             else:
                                 if (row.get('SEM_SEGMENT') == 'E' and 
                                     row.get('SEM_TRADING_SYMBOL') == symbol_name and
@@ -128,27 +130,28 @@ class AIOptionTradingBot:
                                             'trading_symbol': symbol_name,
                                             'type': info['type']
                                         }
-                                        logger.info(f"{symbol}: {sec_id}")
+                                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
                                         break
-                        except Exception:
+                        except Exception as e:
                             continue
                     
                     csv_data_reset = response.text.split('\n')
                     reader = csv.DictReader(csv_data_reset)
                 
-                logger.info(f"Loaded {len(self.security_id_map)} securities")
+                logger.info(f"📊 Total {len(self.security_id_map)} securities loaded")
                 return True
             else:
-                logger.error(f"Failed: {response.status_code}")
+                logger.error(f"❌ Failed to load instruments: {response.status_code}")
                 return False
                 
         except Exception as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"❌ Error loading security IDs: {e}")
             return False
     
     async def get_candle_data(self, security_id, segment):
+        """Get 5-min candle data"""
         try:
-            from_date = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d 09:15:00")
+            from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d 09:15:00")
             to_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
             payload = {
@@ -160,7 +163,14 @@ class AIOptionTradingBot:
                 "toDate": to_date
             }
             
-            response = requests.post(DHAN_INTRADAY_URL, json=payload, headers=self.headers, timeout=15)
+            logger.info(f"📡 Fetching 5min data...")
+            
+            response = requests.post(
+                DHAN_INTRADAY_URL,
+                json=payload,
+                headers=self.headers,
+                timeout=15
+            )
             
             if response.status_code == 200:
                 data = response.json()
@@ -179,39 +189,66 @@ class AIOptionTradingBot:
                             'timestamp': data.get('timestamp', [0]*length)[i]
                         })
                     
-                    logger.info(f"Got {len(candles)} candles")
-                    return candles[-CANDLES_TO_FETCH:]
+                    logger.info(f"✅ Got {len(candles)} candles")
+                    return candles[-100:]  # Last 100 candles
                 
+                logger.warning(f"⚠️ Unexpected response format")
+            else:
+                logger.error(f"❌ Candle API failed: {response.status_code}")
+            
             return None
             
         except Exception as e:
-            logger.error(f"Candle error: {e}")
+            logger.error(f"❌ Error getting candle data: {e}")
             return None
     
     def get_all_expiries(self, security_id, segment):
+        """Get ALL expiries for a symbol with retry logic"""
         max_retries = 2
         for attempt in range(max_retries):
             try:
-                payload = {"UnderlyingScrip": security_id, "UnderlyingSeg": segment}
-                response = requests.post(DHAN_EXPIRY_LIST_URL, json=payload, headers=self.headers, timeout=10)
+                payload = {
+                    "UnderlyingScrip": security_id,
+                    "UnderlyingSeg": segment
+                }
+                
+                logger.info(f"🔍 Fetching expiries (attempt {attempt+1}/{max_retries})")
+                
+                response = requests.post(
+                    DHAN_EXPIRY_LIST_URL,
+                    json=payload,
+                    headers=self.headers,
+                    timeout=10
+                )
                 
                 if response.status_code == 200:
                     data = response.json()
+                    
                     if data.get('status') == 'success' and data.get('data'):
-                        return data['data']
+                        expiries = data['data']
+                        logger.info(f"✅ Found {len(expiries)} expiries: {expiries[:5]}")
+                        return expiries
                     else:
+                        logger.warning(f"⚠️ Expiry response issue: {data}")
                         if attempt < max_retries - 1:
                             import time
                             time.sleep(2)
                             continue
                 elif response.status_code == 429:
+                    logger.warning(f"⚠️ Rate limit hit, waiting 5s...")
                     import time
                     time.sleep(5)
                     if attempt < max_retries - 1:
                         continue
+                else:
+                    logger.error(f"❌ Expiry API failed: {response.status_code}")
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(2)
+                        continue
                 
             except Exception as e:
-                logger.error(f"Expiry error: {e}")
+                logger.error(f"❌ Error getting expiry: {e}")
                 if attempt < max_retries - 1:
                     import time
                     time.sleep(2)
@@ -220,13 +257,14 @@ class AIOptionTradingBot:
         return []
     
     def select_best_expiry(self, symbol, expiry_list, symbol_type):
+        """Intelligent expiry selection"""
         try:
             if not expiry_list:
                 return None
             
             today = datetime.now().date()
-            future_expiries = []
             
+            future_expiries = []
             for e in expiry_list:
                 try:
                     expiry_date = datetime.strptime(e, '%Y-%m-%d').date()
@@ -236,95 +274,131 @@ class AIOptionTradingBot:
                     continue
             
             if not future_expiries:
+                logger.warning(f"⚠️ {symbol}: No future expiries")
                 return None
             
             future_expiries.sort()
             
             if symbol_type == 'index':
                 selected = future_expiries[0]
+                days_to_expiry = (selected - today).days
+                logger.info(f"📅 {symbol}: Weekly expiry = {selected} ({days_to_expiry} days)")
             else:
                 monthly_expiries = [e for e in future_expiries if e.day >= 20]
-                selected = monthly_expiries[0] if monthly_expiries else future_expiries[0]
+                
+                if monthly_expiries:
+                    selected = monthly_expiries[0]
+                    days_to_expiry = (selected - today).days
+                    logger.info(f"📅 {symbol}: Monthly expiry = {selected} ({days_to_expiry} days)")
+                else:
+                    selected = future_expiries[0]
+                    days_to_expiry = (selected - today).days
+                    logger.warning(f"⚠️ {symbol}: Using nearest = {selected} ({days_to_expiry} days)")
             
             return selected.strftime('%Y-%m-%d')
             
         except Exception as e:
-            logger.error(f"Expiry select error: {e}")
+            logger.error(f"❌ Error selecting expiry: {e}")
             return None
     
     def update_expiry_for_symbol(self, symbol, security_id, segment, symbol_type):
+        """Update expiry with auto-rollover"""
         try:
             expiry_list = self.get_all_expiries(security_id, segment)
+            
             if not expiry_list:
+                logger.warning(f"⚠️ {symbol}: No expiries from API")
                 return None
             
             selected_expiry = self.select_best_expiry(symbol, expiry_list, symbol_type)
-            if selected_expiry:
-                self.expiry_map[symbol] = selected_expiry
             
+            if not selected_expiry:
+                return None
+            
+            if symbol in self.expiry_map:
+                old_expiry = self.expiry_map[symbol]
+                if old_expiry != selected_expiry:
+                    logger.warning(f"🔄 {symbol}: Rollover {old_expiry} → {selected_expiry}")
+            
+            self.expiry_map[symbol] = selected_expiry
             return selected_expiry
             
         except Exception as e:
-            logger.error(f"Update expiry error: {e}")
+            logger.error(f"❌ Error updating expiry: {e}")
             return None
     
     async def get_option_chain_safe(self, security_id, segment, expiry):
+        """Rate-limit safe option chain fetch"""
         try:
             import time
             current_time = time.time()
             time_since_last = current_time - self.last_option_chain_call
             
             if time_since_last < 3:
-                await asyncio.sleep(3 - time_since_last)
+                sleep_time = 3 - time_since_last
+                logger.info(f"⏳ Rate limit: Waiting {sleep_time:.1f}s...")
+                await asyncio.sleep(sleep_time)
             
-            payload = {"UnderlyingScrip": security_id, "UnderlyingSeg": segment, "Expiry": expiry}
-            response = requests.post(DHAN_OPTION_CHAIN_URL, json=payload, headers=self.headers, timeout=15)
+            payload = {
+                "UnderlyingScrip": security_id,
+                "UnderlyingSeg": segment,
+                "Expiry": expiry
+            }
+            
+            response = requests.post(
+                DHAN_OPTION_CHAIN_URL,
+                json=payload,
+                headers=self.headers,
+                timeout=15
+            )
             
             self.last_option_chain_call = time.time()
             
             if response.status_code == 200:
                 data = response.json()
+                
                 if data.get('data'):
+                    logger.info(f"✅ Option chain received")
                     return data['data']
+                else:
+                    logger.warning(f"⚠️ No data in response")
+            else:
+                logger.error(f"❌ Option Chain failed: {response.status_code}")
             
             return None
             
         except Exception as e:
-            logger.error(f"Option chain error: {e}")
+            logger.error(f"❌ Error getting option chain: {e}")
             return None
     
     def calculate_technical_indicators(self, candles):
+        """Calculate technical indicators"""
         try:
             closes = [float(c['close']) for c in candles]
             highs = [float(c['high']) for c in candles]
             lows = [float(c['low']) for c in candles]
             volumes = [float(c['volume']) for c in candles]
             
-            resistance = max(highs[-TECHNICAL_LOOKBACK:])
-            support = min(lows[-TECHNICAL_LOOKBACK:])
+            recent_highs = highs[-20:]
+            recent_lows = lows[-20:]
+            
+            resistance = max(recent_highs)
+            support = min(recent_lows)
             
             tr_list = []
-            atr_period = min(ATR_PERIOD, len(candles) - 1)
-            
-            for i in range(1, atr_period + 1):
-                high_low = highs[-i] - lows[-i]
-                high_close = abs(highs[-i] - closes[-i-1])
-                low_close = abs(lows[-i] - closes[-i-1])
-                tr_list.append(max(high_low, high_close, low_close))
+            for i in range(1, min(15, len(candles))):
+                high_low = highs[i] - lows[i]
+                high_close = abs(highs[i] - closes[i-1])
+                low_close = abs(lows[i] - closes[i-1])
+                tr = max(high_low, high_close, low_close)
+                tr_list.append(tr)
             
             atr = sum(tr_list) / len(tr_list) if tr_list else 0
             price_change_pct = ((closes[-1] - closes[0]) / closes[0]) * 100
             
-            avg_volume = sum(volumes[-50:]) / 50
-            volume_spike = (volumes[-1] / avg_volume) if avg_volume > 0 else 1
-            
-            short_ma = sum(closes[-10:]) / 10
-            long_ma = sum(closes[-30:]) / 30
-            trend = "BULLISH" if short_ma > long_ma else "BEARISH"
-            
-            mean_price = sum(closes[-30:]) / 30
-            variance = sum([(x - mean_price)**2 for x in closes[-30:]]) / 30
-            volatility = variance ** 0.5
+            avg_volume = sum(volumes[-20:]) / 20
+            current_volume = volumes[-1]
+            volume_spike = (current_volume / avg_volume) if avg_volume > 0 else 1
             
             return {
                 "current_price": closes[-1],
@@ -333,19 +407,15 @@ class AIOptionTradingBot:
                 "atr": atr,
                 "price_change_pct": price_change_pct,
                 "volume_spike": volume_spike,
-                "avg_volume": avg_volume,
-                "trend": trend,
-                "volatility": volatility,
-                "short_ma": short_ma,
-                "long_ma": long_ma,
-                "data_points": len(candles)
+                "avg_volume": avg_volume
             }
             
         except Exception as e:
-            logger.error(f"Technical error: {e}")
+            logger.error(f"❌ Error calculating indicators: {e}")
             return None
     
     def analyze_option_chain_advanced(self, oc_data, spot_price, symbol):
+        """Advanced option chain analysis"""
         try:
             oc = oc_data.get('oc', {})
             if not oc:
@@ -364,6 +434,13 @@ class AIOptionTradingBot:
             end_idx = min(len(strikes), atm_idx + 6)
             relevant_strikes = strikes[start_idx:end_idx]
             
+            max_ce_oi_strike = None
+            max_pe_oi_strike = None
+            max_ce_oi = 0
+            max_pe_oi = 0
+            
+            strike_wise_data = {}
+            
             for strike in relevant_strikes:
                 strike_key = f"{strike:.6f}"
                 strike_data = oc.get(strike_key, {})
@@ -371,10 +448,52 @@ class AIOptionTradingBot:
                 ce = strike_data.get('ce', {})
                 pe = strike_data.get('pe', {})
                 
-                total_ce_oi += ce.get('oi', 0)
-                total_pe_oi += pe.get('oi', 0)
-                total_ce_volume += ce.get('volume', 0)
-                total_pe_volume += pe.get('volume', 0)
+                ce_oi = ce.get('oi', 0)
+                pe_oi = pe.get('oi', 0)
+                ce_vol = ce.get('volume', 0)
+                pe_vol = pe.get('volume', 0)
+                
+                total_ce_oi += ce_oi
+                total_pe_oi += pe_oi
+                total_ce_volume += ce_vol
+                total_pe_volume += pe_vol
+                
+                if ce_oi > max_ce_oi:
+                    max_ce_oi = ce_oi
+                    max_ce_oi_strike = strike
+                
+                if pe_oi > max_pe_oi:
+                    max_pe_oi = pe_oi
+                    max_pe_oi_strike = strike
+                
+                strike_wise_data[strike] = {
+                    'ce_oi': ce_oi,
+                    'pe_oi': pe_oi,
+                    'ce_vol': ce_vol,
+                    'pe_vol': pe_vol
+                }
+            
+            timestamp = datetime.now().isoformat()
+            
+            if symbol not in self.oi_history:
+                self.oi_history[symbol] = deque(maxlen=5)
+            
+            self.oi_history[symbol].append({
+                'timestamp': timestamp,
+                'ce_oi': total_ce_oi,
+                'pe_oi': total_pe_oi,
+                'strikes': strike_wise_data
+            })
+            
+            oi_change_pct = 0
+            if len(self.oi_history[symbol]) >= 2:
+                old_ce_oi = self.oi_history[symbol][0]['ce_oi']
+                old_pe_oi = self.oi_history[symbol][0]['pe_oi']
+                
+                ce_change = ((total_ce_oi - old_ce_oi) / old_ce_oi * 100) if old_ce_oi > 0 else 0
+                pe_change = ((total_pe_oi - old_pe_oi) / old_pe_oi * 100) if old_pe_oi > 0 else 0
+                
+                oi_change_pct = (ce_change + pe_change) / 2
             
             pcr = (total_pe_oi / total_ce_oi) if total_ce_oi > 0 else 0
             
@@ -385,6 +504,8 @@ class AIOptionTradingBot:
             return {
                 "pcr": pcr,
                 "atm_strike": atm_strike,
+                "max_ce_oi_strike": max_ce_oi_strike,
+                "max_pe_oi_strike": max_pe_oi_strike,
                 "ce_total_oi": total_ce_oi,
                 "pe_total_oi": total_pe_oi,
                 "ce_total_volume": total_ce_volume,
@@ -392,237 +513,360 @@ class AIOptionTradingBot:
                 "atm_ce_price": atm_ce.get('last_price', 0),
                 "atm_pe_price": atm_pe.get('last_price', 0),
                 "atm_ce_iv": atm_ce.get('implied_volatility', 0),
-                "atm_pe_iv": atm_pe.get('implied_volatility', 0)
+                "atm_pe_iv": atm_pe.get('implied_volatility', 0),
+                "oi_change_pct": oi_change_pct,
+                "oi_snapshots": len(self.oi_history[symbol])
             }
             
         except Exception as e:
-            logger.error(f"OC analysis error: {e}")
+            logger.error(f"❌ Error analyzing option chain: {e}")
             return None
     
     async def get_ai_analysis(self, symbol, candles, technical_data, option_data, spot_price):
+        """GPT analysis"""
         try:
-            recent_candles = candles[-AI_CANDLES_COUNT:]
-            
+            recent_candles = candles[-15:]
             candles_summary = [
                 {
-                    "o": round(c.get('open'), 2),
-                    "h": round(c.get('high'), 2),
-                    "l": round(c.get('low'), 2),
-                    "c": round(c.get('close'), 2),
-                    "v": int(c.get('volume', 0))
+                    "open": c.get('open'),
+                    "high": c.get('high'),
+                    "low": c.get('low'),
+                    "close": c.get('close'),
+                    "volume": c.get('volume')
                 }
                 for c in recent_candles
             ]
             
-            atm_ce_premium = option_data.get('atm_ce_price', 0)
-            atm_pe_premium = option_data.get('atm_pe_price', 0)
-            
-            prompt = f"""Expert option trader. Analyze {symbol} trading signal.
+            prompt = f"""Expert option trader analyzing {symbol}:
 
-Market: Spot Rs{spot_price:.2f}
-Trend: {technical_data['trend']}
-Support: Rs{technical_data['support']:.2f}
-Resistance: Rs{technical_data['resistance']:.2f}
-ATR: Rs{technical_data['atr']:.2f}
-PCR: {option_data['pcr']:.2f}
+**Spot:** ₹{spot_price:,.2f}
 
-ATM Strike: Rs{option_data['atm_strike']:.0f}
-CE Premium: Rs{atm_ce_premium:.2f}
-PE Premium: Rs{atm_pe_premium:.2f}
+**Technical (5-min):**
+- Support: ₹{technical_data['support']:,.2f}
+- Resistance: ₹{technical_data['resistance']:,.2f}
+- ATR: ₹{technical_data['atr']:.2f}
+- Price Change: {technical_data['price_change_pct']:.2f}%
+- Volume Spike: {technical_data['volume_spike']:.2f}x
 
-Candles: {json.dumps(candles_summary[:5])}
+**Recent Candles:**
+{json.dumps(candles_summary, indent=2)}
 
-Respond ONLY JSON:
+**Options:**
+- PCR: {option_data['pcr']:.2f}
+- ATM: ₹{option_data['atm_strike']:,.0f}
+- Max CE OI: ₹{option_data.get('max_ce_oi_strike', 0):,.0f}
+- Max PE OI: ₹{option_data.get('max_pe_oi_strike', 0):,.0f}
+- CE OI: {option_data['ce_total_oi']:,} | PE OI: {option_data['pe_total_oi']:,}
+- ATM CE: ₹{option_data['atm_ce_price']:.2f}
+- ATM PE: ₹{option_data['atm_pe_price']:.2f}
+
+**Respond JSON only:**
 {{
     "signal": "BUY_CE" or "BUY_PE" or "NO_TRADE",
-    "confidence": 70-95,
-    "strike": {option_data['atm_strike']},
-    "entry_price": {atm_ce_premium:.2f},
-    "stop_loss": {max(atm_ce_premium * 0.65, 0.5):.2f},
-    "target": {atm_ce_premium * 1.8:.2f},
-    "risk_reward": 2.5,
-    "reasoning": "short reason"
+    "confidence": 0-100,
+    "entry_price": price,
+    "stop_loss": price,
+    "target": price,
+    "strike": strike_price,
+    "reasoning": "brief",
+    "risk_reward": ratio
 }}
 
-Use OPTION premiums only. SL < Entry < Target. RR >= 2.0"""
+**Rules:** Min confidence 70%, Min R:R 1:2.5
+"""
 
-            response = ai_client.chat.completions.create(
-                model=AI_MODEL,
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "Expert options trader. JSON only."},
+                    {"role": "system", "content": "Expert trader. JSON only."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                max_tokens=400
+                max_tokens=500
             )
             
-            content = response.choices[0].message.content.strip()
+            ai_response = response.choices[0].message.content.strip()
             
-            if content.startswith("```"):
-                content = content.replace("```json", "").replace("```", "").strip()
+            if ai_response.startswith("```"):
+                ai_response = ai_response.split("```")[1]
+                if ai_response.startswith("json"):
+                    ai_response = ai_response[4:]
+                ai_response = ai_response.strip()
             
-            analysis = json.loads(content)
+            signal_data = json.loads(ai_response)
             
-            required = ["signal", "confidence", "strike", "entry_price", "stop_loss", "target", "risk_reward", "reasoning"]
-            if not all(f in analysis for f in required):
-                return None
+            logger.info(f"🤖 Signal: {signal_data.get('signal')} | Confidence: {signal_data.get('confidence')}%")
             
-            if analysis['signal'] in ['BUY_CE', 'BUY_PE']:
-                if analysis['stop_loss'] >= analysis['entry_price'] or analysis['target'] <= analysis['entry_price'] or analysis['confidence'] < 65:
-                    return None
-            
-            logger.info(f"AI: {analysis['signal']} @ Rs{analysis.get('entry_price', 0):.2f}")
-            return analysis
+            return signal_data
             
         except Exception as e:
-            logger.error(f"AI error: {e}")
+            logger.error(f"❌ AI analysis error: {e}")
             return None
     
-    async def send_telegram_message(self, message):
+    def format_signal_message(self, symbol, signal_data, spot_price, expiry, technical_data):
+        """Format signal for Telegram"""
         try:
-            await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML')
+            signal_type = signal_data.get('signal')
+            
+            if signal_type == "NO_TRADE":
+                return None
+            
+            confidence = signal_data.get('confidence', 0)
+            signal_emoji = "🟢 BUY CALL" if signal_type == "BUY_CE" else "🔴 BUY PUT"
+            
+            msg = f"{signal_emoji}\n"
+            msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+            msg += f"*{symbol}*\n"
+            msg += f"Spot: ₹{spot_price:,.2f}\n"
+            msg += f"Expiry: {expiry}\n\n"
+            
+            msg += f"*💰 Trade:*\n"
+            msg += f"Strike: ₹{signal_data.get('strike', 0):,.0f}\n"
+            msg += f"Entry: ₹{signal_data.get('entry_price', 0):.2f}\n"
+            msg += f"SL: ₹{signal_data.get('stop_loss', 0):.2f}\n"
+            msg += f"Target: ₹{signal_data.get('target', 0):.2f}\n"
+            msg += f"R:R = 1:{signal_data.get('risk_reward', 0):.2f}\n\n"
+            
+            msg += f"*🎯 Confidence:* {confidence}%\n\n"
+            
+            msg += f"*📍 Levels:*\n"
+            msg += f"Support: ₹{technical_data['support']:,.2f}\n"
+            msg += f"Resistance: ₹{technical_data['resistance']:,.2f}\n\n"
+            
+            msg += f"*💡 Reason:*\n_{signal_data.get('reasoning', 'N/A')}_\n\n"
+            
+            msg += f"*⚠️ Risk:* 2-3% capital\n\n"
+            
+            msg += f"🕒 {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
+            
+            return msg
+            
         except Exception as e:
-            logger.error(f"Telegram error: {e}")
+            logger.error(f"❌ Error formatting: {e}")
+            return None
     
-    async def analyze_symbol(self, symbol):
-        try:
-            logger.info(f"Analyzing: {symbol}")
-            
-            if symbol not in self.security_id_map:
-                return
-            
-            sec_info = self.security_id_map[symbol]
-            security_id = sec_info['security_id']
-            segment = sec_info['segment']
-            symbol_type = sec_info['type']
-            
-            candles = await self.get_candle_data(security_id, segment)
-            if not candles or len(candles) < 50:
-                return
-            
-            technical_data = self.calculate_technical_indicators(candles)
-            if not technical_data:
-                return
-            
-            spot_price = technical_data['current_price']
-            logger.info(f"{symbol}: Rs{spot_price:.2f} {technical_data['trend']}")
-            
-            expiry = self.update_expiry_for_symbol(symbol, security_id, segment, symbol_type)
-            if not expiry:
-                return
-            
-            oc_data = await self.get_option_chain_safe(security_id, segment, expiry)
-            if not oc_data:
-                return
-            
-            option_data = self.analyze_option_chain_advanced(oc_data, spot_price, symbol)
-            if not option_data:
-                return
-            
-            logger.info(f"PCR: {option_data['pcr']:.2f}")
-            
-            ai_analysis = await self.get_ai_analysis(symbol, candles, technical_data, option_data, spot_price)
-            
-            if ai_analysis and ai_analysis['signal'] in ['BUY_CE', 'BUY_PE']:
-                await self.send_trade_signal(symbol, ai_analysis, technical_data, option_data, expiry)
-            else:
-                logger.info(f"{symbol}: NO_TRADE - {ai_analysis.get('reasoning', 'No clear signal') if ai_analysis else 'Analysis failed'}")
-            
-        except Exception as e:
-            logger.error(f"Analysis error: {e}")
-    
-    async def send_trade_signal(self, symbol, ai, tech, opt, expiry):
-        try:
-            signal_type = "CALL" if ai['signal'] == 'BUY_CE' else "PUT"
-            
-            msg = f"""<b>{signal_type} - {symbol}</b>
-
-Spot: Rs{tech['current_price']:.2f}
-Trend: {tech['trend']}
-PCR: {opt['pcr']:.2f}
-
-Strike: Rs{ai['strike']:.0f}
-Expiry: {expiry}
-Entry: Rs{ai['entry_price']:.2f}
-SL: Rs{ai['stop_loss']:.2f}
-Target: Rs{ai['target']:.2f}
-RR: {ai['risk_reward']:.2f}
-
-Confidence: {ai['confidence']}%
-
-{ai['reasoning']}
-
-{datetime.now().strftime('%d-%m-%Y %I:%M %p')}"""
-            
-            await self.send_telegram_message(msg)
-            logger.info(f"{symbol}: Signal sent")
-            
-        except Exception as e:
-            logger.error(f"Signal error: {e}")
-    
-    async def run_analysis_cycle(self):
-        try:
-            logger.info(f"Cycle start: {datetime.now().strftime('%I:%M %p')}")
-            
-            for symbol in STOCKS_INDICES.keys():
-                await self.analyze_symbol(symbol)
-                await asyncio.sleep(2)
-            
-            logger.info("Cycle complete")
-            
-        except Exception as e:
-            logger.error(f"Cycle error: {e}")
-    
-    async def start(self):
-        try:
-            success = await self.load_security_ids()
-            if not success:
-                logger.error("Failed to load IDs")
-                return
-            
-            await self.send_telegram_message("<b>Bot Started</b>")
-            logger.info("Starting main loop...")
-            
-            while self.running:
-                try:
-                    current_time = datetime.now()
-                    logger.info(f"Current time: {current_time.strftime('%I:%M %p')}")
-                    
-                    if current_time.weekday() < 5:
-                        market_start = current_time.replace(hour=9, minute=15, second=0)
-                        market_end = current_time.replace(hour=15, minute=30, second=0)
-                        
-                        if market_start <= current_time <= market_end:
-                            logger.info("Market hours - Starting analysis")
-                            await self.run_analysis_cycle()
-                            logger.info("Waiting 15 min")
-                            await asyncio.sleep(900)
-                        else:
-                            logger.info("Outside market hours - Waiting 5 min")
-                            await asyncio.sleep(300)
-                    else:
-                        logger.info("Weekend - Waiting 1 hour")
-                        await asyncio.sleep(3600)
-                
-                except Exception as cycle_error:
-                    logger.error(f"Cycle error: {cycle_error}")
-                    await asyncio.sleep(60)
-                    
-        except KeyboardInterrupt:
-            logger.info("Stopped by user")
-        except Exception as e:
-            logger.error(f"Bot error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-        finally:
+    async def analyze_and_send_signals(self, symbols_batch):
+        """Main analysis function"""
+        for symbol in symbols_batch:
             try:
-                await self.send_telegram_message("<b>Bot Stopped</b>")
-            except:
-                pass
+                if symbol not in self.security_id_map:
+                    continue
+                
+                info = self.security_id_map[symbol]
+                security_id = info['security_id']
+                segment = info['segment']
+                symbol_type = info['type']
+                
+                logger.info(f"📊 Analyzing {symbol}...")
+                
+                # Get expiry
+                expiry = self.update_expiry_for_symbol(symbol, security_id, segment, symbol_type)
+                if not expiry:
+                    logger.warning(f"⚠️ {symbol}: No expiry, skipping")
+                    await asyncio.sleep(2)
+                    continue
+                
+                logger.info(f"📅 {symbol}: Using expiry: {expiry}")
+                await asyncio.sleep(1)
+                
+                # Get candle data
+                candles = await self.get_candle_data(security_id, segment)
+                if not candles or len(candles) < 50:
+                    logger.warning(f"⚠️ {symbol}: Insufficient candles ({len(candles) if candles else 0})")
+                    continue
+                
+                # Technical analysis
+                technical_data = self.calculate_technical_indicators(candles)
+                if not technical_data:
+                    continue
+                
+                spot_price = technical_data['current_price']
+                logger.info(f"📈 Spot: ₹{spot_price:,.2f}")
+                
+                # Option chain
+                oc_data = await self.get_option_chain_safe(security_id, segment, expiry)
+                if not oc_data:
+                    logger.warning(f"⚠️ {symbol}: No option chain")
+                    await asyncio.sleep(3)
+                    continue
+                
+                # OI analysis
+                option_analysis = self.analyze_option_chain_advanced(oc_data, spot_price, symbol)
+                if not option_analysis:
+                    continue
+                
+                logger.info(f"📊 PCR={option_analysis['pcr']:.2f}")
+                
+                # AI analysis
+                signal_data = await self.get_ai_analysis(
+                    symbol, candles, technical_data, option_analysis, spot_price
+                )
+                
+                if not signal_data:
+                    await asyncio.sleep(3)
+                    continue
+                
+                # Send signal
+                if signal_data.get('signal') != 'NO_TRADE' and signal_data.get('confidence', 0) >= 70:
+                    message = self.format_signal_message(symbol, signal_data, spot_price, expiry, technical_data)
+                    if message:
+                        await self.bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=message,
+                            parse_mode='Markdown'
+                        )
+                        logger.info(f"🚀 Signal sent for {symbol}!")
+                else:
+                    logger.info(f"⏸️ {symbol}: No trade (Conf: {signal_data.get('confidence', 0)}%)")
+                
+                await asyncio.sleep(3)
+                
+            except Exception as e:
+                logger.error(f"❌ Error processing {symbol}: {e}")
+                await asyncio.sleep(3)
+    
+    def is_market_hours(self):
+        """Check market hours"""
+        now = datetime.now()
+        
+        if now.weekday() >= 5:
+            return False
+        
+        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        
+        return market_open <= now <= market_close
+    
+    async def send_startup_message(self):
+        """Startup message"""
+        try:
+            indices_count = len([s for s, info in self.security_id_map.items() if info['type'] == 'index'])
+            stocks_count = len([s for s, info in self.security_id_map.items() if info['type'] == 'stock'])
+            
+            msg = "🚀 *AI Option Trading Bot Started!*\n\n"
+            msg += "🤖 *Powered by GPT-4o-mini*\n\n"
+            
+            msg += "*📊 Coverage:*\n"
+            msg += f"• {indices_count} Indices (Weekly)\n"
+            msg += f"• {stocks_count} Stocks (Monthly)\n\n"
+            
+            msg += "*🎯 Features:*\n"
+            msg += "✅ 5-Min Analysis\n"
+            msg += "✅ Auto Expiry (API)\n"
+            msg += "✅ OI Tracking\n"
+            msg += "✅ Rate Limit Safe\n\n"
+            
+            msg += "*⚙️ Settings:*\n"
+            msg += "• Cycle: 5 minutes\n"
+            msg += "• Min Confidence: 70%\n"
+            msg += "• Min R:R: 1:2.5\n\n"
+            
+            msg += "⚠️ *Educational only*\n\n"
+            msg += "_Market: 9:15 AM - 3:30 PM_"
+            
+            await self.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=msg,
+                parse_mode='Markdown'
+            )
+            logger.info("✅ Startup message sent")
+        except Exception as e:
+            logger.error(f"❌ Startup message error: {e}")
+    
+    async def perform_analysis_cycle(self, indices, stocks, cycle_num):
+        """Analysis cycle"""
+        try:
+            if not self.is_market_hours():
+                logger.warning("⚠️ Market CLOSED")
+            
+            # Indices
+            if indices:
+                logger.info(f"📊 Analyzing {len(indices)} indices...")
+                await self.analyze_and_send_signals(indices)
+                await asyncio.sleep(5)
+            
+            # Stocks
+            if stocks:
+                logger.info(f"📈 Scanning {len(stocks)} stocks...")
+                
+                batch_size = 5
+                stock_batches = [stocks[i:i+batch_size] for i in range(0, len(stocks), batch_size)]
+                
+                for batch_num, batch in enumerate(stock_batches, 1):
+                    logger.info(f"📦 Batch {batch_num}/{len(stock_batches)}")
+                    await self.analyze_and_send_signals(batch)
+                    
+                    if batch_num < len(stock_batches):
+                        await asyncio.sleep(10)
+            
+            logger.info(f"✅ Cycle #{cycle_num} done!")
+            
+        except Exception as e:
+            logger.error(f"❌ Cycle error: {e}")
+            raise
+    
+    async def run(self):
+        """Main loop"""
+        logger.info("🚀 Starting bot...")
+        
+        success = await self.load_security_ids()
+        if not success:
+            logger.error("❌ Failed to load IDs")
+            return
+        
+        await self.send_startup_message()
+        
+        indices = [s for s, info in self.security_id_map.items() if info['type'] == 'index']
+        stocks = [s for s, info in self.security_id_map.items() if info['type'] == 'stock']
+        
+        logger.info(f"📊 {len(indices)} Indices | {len(stocks)} Stocks")
+        
+        # First scan
+        logger.info("🔥 IMMEDIATE SCAN...")
+        await self.perform_analysis_cycle(indices, stocks, 1)
+        logger.info("✅ Initial scan done!")
+        
+        cycle_count = 1
+        
+        while self.running:
+            try:
+                cycle_count += 1
+                
+                logger.info(f"⏳ Waiting 5 minutes...")
+                await asyncio.sleep(300)
+                
+                logger.info(f"🔄 Cycle #{cycle_count}")
+                await self.perform_analysis_cycle(indices, stocks, cycle_count)
+                
+            except KeyboardInterrupt:
+                logger.info("🛑 Stopped by user")
+                self.running = False
+                break
+            except Exception as e:
+                logger.error(f"❌ Main loop error: {e}")
+                await asyncio.sleep(60)
 
-async def main():
-    bot = AIOptionTradingBot()
-    await bot.start()
 
+# ========================
+# RUN
+# ========================
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        required_vars = [
+            TELEGRAM_BOT_TOKEN,
+            TELEGRAM_CHAT_ID,
+            DHAN_CLIENT_ID,
+            DHAN_ACCESS_TOKEN,
+            OPENAI_API_KEY
+        ]
+        
+        if not all(required_vars):
+            logger.error("❌ Missing env vars!")
+            exit(1)
+        
+        bot = AIOptionTradingBot()
+        asyncio.run(bot.run())
+        
+    except Exception as e:
+        logger.error(f"❌ Fatal: {e}")
+        exit(1)
