@@ -38,12 +38,12 @@ DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 # Stock/Index List
 STOCKS_INDICES = {
     # Indices (Weekly Expiry Focus)
-    "NIFTY 50": {"symbol": "NIFTY 50", "segment": "IDX_I", "type": "index"},
-    "NIFTY BANK": {"symbol": "NIFTY BANK", "segment": "IDX_I", "type": "index"},
+    "NIFTY 50": {"symbol": "Nifty 50", "segment": "IDX_I", "type": "index"},
+    "NIFTY BANK": {"symbol": "Nifty Bank", "segment": "IDX_I", "type": "index"},
     "SENSEX": {"symbol": "SENSEX", "segment": "IDX_I", "type": "index"},
     "FINNIFTY": {"symbol": "FINNIFTY", "segment": "IDX_I", "type": "index"},
     
-    # High Volume Stocks (Monthly Expiry - 20 days before scan)
+    # High Volume Stocks (Monthly Expiry)
     "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ", "type": "stock"},
     "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ", "type": "stock"},
     "ICICIBANK": {"symbol": "ICICIBANK", "segment": "NSE_EQ", "type": "stock"},
@@ -244,7 +244,7 @@ class AIOptionTradingBot:
         """
         🆕 Intelligent expiry selection
         - Indices: Weekly (nearest)
-        - Stocks: Monthly (10 days before check)
+        - Stocks: Monthly (nearest monthly expiry)
         """
         try:
             if not expiry_list:
@@ -267,19 +267,18 @@ class AIOptionTradingBot:
                 selected = future_expiries[0]
                 logger.info(f"📅 {symbol}: Weekly expiry selected: {selected}")
             else:
-                # Stock: Monthly expiry (20 days before)
-                for expiry in future_expiries:
-                    days_to_expiry = (expiry - today).days
-                    
-                    # Check if within 20 days window
-                    if 0 <= days_to_expiry <= 20:
-                        selected = expiry
-                        logger.info(f"📅 {symbol}: Within 20-day window! Expiry: {selected} ({days_to_expiry} days)")
-                        break
+                # Stock: Monthly expiry (nearest monthly - typically last Thursday)
+                # Look for expiry that's likely monthly (day > 20)
+                monthly_expiries = [e for e in future_expiries if e.day >= 24]
+                
+                if monthly_expiries:
+                    selected = monthly_expiries[0]  # Nearest monthly
+                    days_to_expiry = (selected - today).days
+                    logger.info(f"📅 {symbol}: Monthly expiry selected: {selected} ({days_to_expiry} days away)")
                 else:
-                    # No expiry in window, skip this stock
-                    logger.info(f"⏭️ {symbol}: No expiry within 20 days. Skipping...")
-                    return None
+                    # Fallback to nearest expiry
+                    selected = future_expiries[0]
+                    logger.info(f"📅 {symbol}: Nearest expiry selected: {selected}")
             
             return selected.strftime('%Y-%m-%d')
             
@@ -707,12 +706,11 @@ class AIOptionTradingBot:
                 
                 logger.info(f"📊 Analyzing {symbol} ({symbol_type})...")
                 
-                # 🆕 Update expiry (auto-rollover + 20-day window for stocks)
+                # 🆕 Update expiry (auto-rollover)
                 expiry = self.update_expiry_for_symbol(symbol, security_id, segment, symbol_type)
                 
                 if not expiry:
-                    if symbol_type == 'stock':
-                        logger.info(f"⏭️ {symbol}: Skipping (no expiry in 20-day window)")
+                    logger.warning(f"⚠️ {symbol}: No expiry found, skipping...")
                     continue
                 
                 # 🆕 Multi-timeframe data
@@ -835,7 +833,7 @@ class AIOptionTradingBot:
             
             # Analyze stocks (batch processing)
             if stocks:
-                logger.info(f"📈 Scanning {len(stocks)} stocks (20-day expiry window)...")
+                logger.info(f"📈 Scanning {len(stocks)} stocks...")
                 
                 batch_size = 5
                 stock_batches = [stocks[i:i+batch_size] for i in range(0, len(stocks), batch_size)]
@@ -866,7 +864,7 @@ class AIOptionTradingBot:
             
             msg += "*📊 Coverage:*\n"
             msg += f"• {indices_count} Indices (Weekly expiry)\n"
-            msg += f"• {stocks_count} Stocks (Monthly expiry, 20-day window)\n\n"
+            msg += f"• {stocks_count} Stocks (Monthly expiry)\n\n"
             
             msg += "*🎯 Features:*\n"
             msg += "✅ Multi-Timeframe Analysis (5m, 15m, 1h)\n"
@@ -883,7 +881,7 @@ class AIOptionTradingBot:
             
             msg += "*📅 Expiry Logic:*\n"
             msg += "• Indices: Nearest weekly\n"
-            msg += "• Stocks: Monthly (20 days before)\n\n"
+            msg += "• Stocks: Nearest monthly\n\n"
             
             msg += "⚠️ *Disclaimer:* Educational purposes only. Trade at your own risk.\n\n"
             msg += "_Market Hours: 9:15 AM - 3:30 PM (Mon-Fri)_"
