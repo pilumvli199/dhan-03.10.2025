@@ -8,9 +8,7 @@ import csv
 import json
 from openai import OpenAI
 from collections import deque
-import numpy as np
 from typing import Dict, List, Optional, Tuple
-import pandas as pd
 
 # Logging setup
 logging.basicConfig(
