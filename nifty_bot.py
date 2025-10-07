@@ -45,8 +45,8 @@ ATR_PERIOD = 30
 AI_CANDLES_COUNT = 30
 
 STOCKS_INDICES = {
-    "NIFTY 50": {"symbol": "Nifty 50", "segment": "IDX_I", "type": "index"},
-    "NIFTY BANK": {"symbol": "Nifty Bank", "segment": "IDX_I", "type": "index"},
+    "NIFTY": {"symbol": "NIFTY 50", "segment": "IDX_I", "type": "index"},
+    "BANKNIFTY": {"symbol": "NIFTY BANK", "segment": "IDX_I", "type": "index"},
     "SENSEX": {"symbol": "SENSEX", "segment": "IDX_I", "type": "index"},
     "FINNIFTY": {"symbol": "FINNIFTY", "segment": "IDX_I", "type": "index"},
     "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ", "type": "stock"},
@@ -579,29 +579,44 @@ Confidence: {ai['confidence']}%
                 return
             
             await self.send_telegram_message("<b>Bot Started</b>")
+            logger.info("Starting main loop...")
             
             while self.running:
-                current_time = datetime.now()
-                
-                if current_time.weekday() < 5:
-                    market_start = current_time.replace(hour=9, minute=15, second=0)
-                    market_end = current_time.replace(hour=15, minute=30, second=0)
+                try:
+                    current_time = datetime.now()
+                    logger.info(f"Current time: {current_time.strftime('%I:%M %p')}")
                     
-                    if market_start <= current_time <= market_end:
-                        await self.run_analysis_cycle()
-                        logger.info("Waiting 15 min")
-                        await asyncio.sleep(900)
+                    if current_time.weekday() < 5:
+                        market_start = current_time.replace(hour=9, minute=15, second=0)
+                        market_end = current_time.replace(hour=15, minute=30, second=0)
+                        
+                        if market_start <= current_time <= market_end:
+                            logger.info("Market hours - Starting analysis")
+                            await self.run_analysis_cycle()
+                            logger.info("Waiting 15 min")
+                            await asyncio.sleep(900)
+                        else:
+                            logger.info("Outside market hours - Waiting 5 min")
+                            await asyncio.sleep(300)
                     else:
-                        await asyncio.sleep(300)
-                else:
-                    await asyncio.sleep(3600)
+                        logger.info("Weekend - Waiting 1 hour")
+                        await asyncio.sleep(3600)
+                
+                except Exception as cycle_error:
+                    logger.error(f"Cycle error: {cycle_error}")
+                    await asyncio.sleep(60)
                     
         except KeyboardInterrupt:
             logger.info("Stopped by user")
         except Exception as e:
             logger.error(f"Bot error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
         finally:
-            await self.send_telegram_message("<b>Bot Stopped</b>")
+            try:
+                await self.send_telegram_message("<b>Bot Stopped</b>")
+            except:
+                pass
 
 async def main():
     bot = AIOptionTradingBot()
