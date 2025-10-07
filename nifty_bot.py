@@ -82,9 +82,9 @@ class AIOptionTradingBot:
             'Accept': 'application/json'
         }
         self.security_id_map = {}
-        self.expiry_map = {}  # Track expiries for each symbol
-        self.oi_history = {}  # Track OI changes in memory (last 5 snapshots)
-        self.last_option_chain_call = 0  # Rate limit tracking
+        self.expiry_map = {}
+        self.oi_history = {}
+        self.last_option_chain_call = 0
         logger.info("🚀 Advanced AI Option Trading Bot initialized")
     
     async def load_security_ids(self):
@@ -149,9 +149,7 @@ class AIOptionTradingBot:
             return False
     
     async def get_multi_timeframe_data(self, security_id, segment):
-        """
-        🆕 Simplified: Only 5-min timeframe (faster & reliable)
-        """
+        """Get 5-min candle data"""
         try:
             from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d 09:15:00")
             to_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -192,8 +190,7 @@ class AIOptionTradingBot:
                             'timestamp': data.get('timestamp', [0]*length)[i]
                         })
                     
-                    # Return in dict format for compatibility
-                    return {'5min': candles[-100:]}  # Last 100 candles
+                    return {'5min': candles[-100:]}
                 
                 logger.warning(f"⚠️ Unexpected response format")
             else:
@@ -206,200 +203,153 @@ class AIOptionTradingBot:
             return None
     
     def get_all_expiries(self, security_id, segment):
-        """
-        🆕 Get ALL expiries for a symbol with detailed logging
-        """
-        try:
-            payload = {
-                "UnderlyingScrip": security_id,
-                "UnderlyingSeg": segment
-            }
-            
-            logger.info(f"🔍 Fetching expiries - Payload: {payload}")
-            
-            response = requests.post(
-                DHAN_EXPIRY_LIST_URL,
-                json=payload,
-                headers=self.headers,
-                timeout=10
-            )
-            
-            logger.info(f"📡 Expiry API Status: {response.status_code}")
-            
-            if response.status_code == 200:
-                data = response.json()
-                logger.info(f"📦 Expiry Response: {data}")
+        """Get ALL expiries for a symbol with retry logic"""
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                payload = {
+                    "UnderlyingScrip": security_id,
+                    "UnderlyingSeg": segment
+                }
                 
-                if data.get('status') == 'success' and data.get('data'):
-                    expiries = data['data']
-                    logger.info(f"✅ Found {len(expiries)} expiries: {expiries[:3]}...")
-                    return expiries
+                logger.info(f"🔍 Fetching expiries (attempt {attempt+1}/{max_retries}) - Payload: {payload}")
+                
+                response = requests.post(
+                    DHAN_EXPIRY_LIST_URL,
+                    json=payload,
+                    headers=self.headers,
+                    timeout=10
+                )
+                
+                logger.info(f"📡 Expiry API Status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if data.get('status') == 'success' and data.get('data'):
+                        expiries = data['data']
+                        logger.info(f"✅ Found {len(expiries)} expiries: {expiries[:5]}")
+                        return expiries
+                    else:
+                        logger.warning(f"⚠️ Expiry response issue: {data}")
+                        if attempt < max_retries - 1:
+                            import time
+                            time.sleep(2)
+                            continue
+                elif response.status_code == 429:
+                    logger.warning(f"⚠️ Rate limit hit, waiting 5s...")
+                    import time
+                    time.sleep(5)
+                    if attempt < max_retries - 1:
+                        continue
                 else:
-                    logger.warning(f"⚠️ Expiry response format issue: {data}")
-            else:
-                logger.error(f"❌ Expiry API failed: {response.status_code} - {response.text}")
-            
-            return []
-            
-        except Exception as e:
-            logger.error(f"❌ Error getting expiry list: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return []
+                    logger.error(f"❌ Expiry API failed: {response.status_code} - {response.text[:200]}")
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(2)
+                        continue
+                
+            except requests.exceptions.Timeout:
+                logger.error(f"❌ Expiry API timeout (attempt {attempt+1})")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(2)
+                    continue
+            except Exception as e:
+                logger.error(f"❌ Error getting expiry list: {e}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(2)
+                    continue
+        
+        return []
     
     def select_best_expiry(self, symbol, expiry_list, symbol_type):
-        """
-        🆕 Intelligent expiry selection
-        - Indices: Weekly (nearest)
-        - Stocks: Monthly (nearest monthly expiry)
-        """
+        """Intelligent expiry selection"""
         try:
             if not expiry_list:
                 return None
             
             today = datetime.now().date()
-            future_expiries = [
-                datetime.strptime(e, '%Y-%m-%d').date() 
-                for e in expiry_list 
-                if datetime.strptime(e, '%Y-%m-%d').date() >= today
-            ]
+            
+            # Parse and filter future expiries
+            future_expiries = []
+            for e in expiry_list:
+                try:
+                    expiry_date = datetime.strptime(e, '%Y-%m-%d').date()
+                    if expiry_date >= today:
+                        future_expiries.append(expiry_date)
+                except:
+                    continue
             
             if not future_expiries:
+                logger.warning(f"⚠️ {symbol}: No future expiries found in {expiry_list[:3]}")
                 return None
             
             future_expiries.sort()
             
             if symbol_type == 'index':
-                # Weekly expiry (nearest)
+                # Indices: Nearest weekly expiry
                 selected = future_expiries[0]
-                logger.info(f"📅 {symbol}: Weekly expiry selected: {selected}")
+                days_to_expiry = (selected - today).days
+                logger.info(f"📅 {symbol}: Weekly expiry = {selected} ({days_to_expiry} days away)")
             else:
-                # Stock: Monthly expiry (nearest monthly - typically last Thursday)
-                # Look for expiry that's likely monthly (day > 20)
-                monthly_expiries = [e for e in future_expiries if e.day >= 24]
+                # Stocks: Find monthly expiry (last Thursday pattern - day >= 20)
+                monthly_expiries = [e for e in future_expiries if e.day >= 20]
                 
                 if monthly_expiries:
-                    selected = monthly_expiries[0]  # Nearest monthly
+                    selected = monthly_expiries[0]
                     days_to_expiry = (selected - today).days
-                    logger.info(f"📅 {symbol}: Monthly expiry selected: {selected} ({days_to_expiry} days away)")
+                    logger.info(f"📅 {symbol}: Monthly expiry = {selected} ({days_to_expiry} days away)")
                 else:
-                    # Fallback to nearest expiry
+                    # Fallback: Just use nearest expiry
                     selected = future_expiries[0]
-                    logger.info(f"📅 {symbol}: Nearest expiry selected: {selected}")
+                    days_to_expiry = (selected - today).days
+                    logger.warning(f"⚠️ {symbol}: No monthly pattern found, using nearest = {selected} ({days_to_expiry} days)")
             
             return selected.strftime('%Y-%m-%d')
             
         except Exception as e:
-            logger.error(f"❌ Error selecting expiry: {e}")
+            logger.error(f"❌ Error selecting expiry for {symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
     
-    def get_fallback_expiry(self, symbol, symbol_type):
-        """
-        🆕 Quick fallback expiry calculation (no API call needed)
-        """
-        try:
-            today = datetime.now().date()
-            
-            if symbol_type == 'index':
-                # Weekly expiry - next Thursday
-                days_ahead = 3 - today.weekday()  # Thursday = 3
-                if days_ahead <= 0:
-                    days_ahead += 7
-                expiry_date = today + timedelta(days=days_ahead)
-            else:
-                # Monthly expiry - last Thursday of current month
-                import calendar
-                last_day = calendar.monthrange(today.year, today.month)[1]
-                last_date = datetime(today.year, today.month, last_day).date()
-                
-                # Find last Thursday
-                days_back = (last_date.weekday() - 3) % 7
-                expiry_date = last_date - timedelta(days=days_back)
-                
-                # If already passed, use next month
-                if expiry_date < today:
-                    next_month = today.month + 1 if today.month < 12 else 1
-                    next_year = today.year if today.month < 12 else today.year + 1
-                    last_day_next = calendar.monthrange(next_year, next_month)[1]
-                    last_date_next = datetime(next_year, next_month, last_day_next).date()
-                    days_back = (last_date_next.weekday() - 3) % 7
-                    expiry_date = last_date_next - timedelta(days=days_back)
-            
-            return expiry_date.strftime('%Y-%m-%d')
-            
-        except Exception as e:
-            logger.error(f"❌ Error calculating fallback expiry: {e}")
-            # Ultimate fallback
-            return (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
-    
     def update_expiry_for_symbol(self, symbol, security_id, segment, symbol_type):
-        """
-        🆕 Update expiry with auto-rollover logic + fallback
-        """
+        """Update expiry with auto-rollover logic"""
         try:
-            # Get all expiries
+            # Get all expiries from API
             expiry_list = self.get_all_expiries(security_id, segment)
             
             if not expiry_list:
-                logger.warning(f"⚠️ {symbol}: No expiry list from API, using fallback...")
-                # Fallback: Use default expiry based on today's date
-                today = datetime.now().date()
-                
-                if symbol_type == 'index':
-                    # Weekly expiry - next Thursday
-                    days_ahead = 3 - today.weekday()  # Thursday = 3
-                    if days_ahead <= 0:
-                        days_ahead += 7
-                    fallback_expiry = today + timedelta(days=days_ahead)
-                else:
-                    # Monthly expiry - last Thursday of current month
-                    import calendar
-                    last_day = calendar.monthrange(today.year, today.month)[1]
-                    last_date = datetime(today.year, today.month, last_day).date()
-                    
-                    # Find last Thursday
-                    days_back = (last_date.weekday() - 3) % 7
-                    fallback_expiry = last_date - timedelta(days=days_back)
-                    
-                    # If already passed, use next month
-                    if fallback_expiry < today:
-                        next_month = today.month + 1 if today.month < 12 else 1
-                        next_year = today.year if today.month < 12 else today.year + 1
-                        last_day_next = calendar.monthrange(next_year, next_month)[1]
-                        last_date_next = datetime(next_year, next_month, last_day_next).date()
-                        days_back = (last_date_next.weekday() - 3) % 7
-                        fallback_expiry = last_date_next - timedelta(days=days_back)
-                
-                selected_expiry = fallback_expiry.strftime('%Y-%m-%d')
-                logger.info(f"📅 {symbol}: Using fallback expiry: {selected_expiry}")
-                self.expiry_map[symbol] = selected_expiry
-                return selected_expiry
+                logger.warning(f"⚠️ {symbol}: API returned no expiries")
+                return None
             
             # Select best expiry from list
             selected_expiry = self.select_best_expiry(symbol, expiry_list, symbol_type)
             
-            # Check if expiry changed
+            if not selected_expiry:
+                logger.warning(f"⚠️ {symbol}: Could not select valid expiry from list: {expiry_list[:3]}")
+                return None
+            
+            # Check if expiry changed (rollover detection)
             if symbol in self.expiry_map:
                 old_expiry = self.expiry_map[symbol]
                 if old_expiry != selected_expiry:
                     logger.warning(f"🔄 {symbol}: Expiry rollover! {old_expiry} → {selected_expiry}")
             
             # Update expiry map
-            if selected_expiry:
-                self.expiry_map[symbol] = selected_expiry
-            
+            self.expiry_map[symbol] = selected_expiry
             return selected_expiry
             
         except Exception as e:
-            logger.error(f"❌ Error updating expiry: {e}")
+            logger.error(f"❌ Error updating expiry for {symbol}: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return None
     
     async def get_option_chain_safe(self, security_id, segment, expiry):
-        """
-        🆕 Rate-limit safe option chain fetch with detailed logging
-        """
+        """Rate-limit safe option chain fetch"""
         try:
             import time
             current_time = time.time()
@@ -450,7 +400,7 @@ class AIOptionTradingBot:
             return None
     
     def calculate_technical_indicators(self, candles):
-        """Calculate key technical indicators from 5-min candles"""
+        """Calculate key technical indicators"""
         try:
             closes = [float(c['close']) for c in candles]
             highs = [float(c['high']) for c in candles]
@@ -492,72 +442,8 @@ class AIOptionTradingBot:
             logger.error(f"❌ Error calculating indicators: {e}")
             return None
     
-    def calculate_multi_tf_indicators(self, multi_tf_data):
-        """
-        🆕 Calculate technical indicators across timeframes
-        """
-        try:
-            all_indicators = {}
-            
-            for tf, candles in multi_tf_data.items():
-                if not candles or len(candles) < 20:
-                    continue
-                
-                closes = [float(c['close']) for c in candles]
-                highs = [float(c['high']) for c in candles]
-                lows = [float(c['low']) for c in candles]
-                volumes = [float(c['volume']) for c in candles]
-                
-                # Support/Resistance
-                recent_highs = highs[-20:]
-                recent_lows = lows[-20:]
-                resistance = max(recent_highs)
-                support = min(recent_lows)
-                
-                # ATR
-                tr_list = []
-                for i in range(1, min(15, len(candles))):
-                    high_low = highs[i] - lows[i]
-                    high_close = abs(highs[i] - closes[i-1])
-                    low_close = abs(lows[i] - closes[i-1])
-                    tr = max(high_low, high_close, low_close)
-                    tr_list.append(tr)
-                
-                atr = sum(tr_list) / len(tr_list) if tr_list else 0
-                
-                # Trend
-                price_change = ((closes[-1] - closes[0]) / closes[0]) * 100
-                
-                # Volume
-                avg_volume = sum(volumes[-20:]) / 20
-                volume_spike = (volumes[-1] / avg_volume) if avg_volume > 0 else 1
-                
-                # Moving averages
-                ma_20 = sum(closes[-20:]) / 20
-                ma_50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else ma_20
-                
-                all_indicators[tf] = {
-                    "current_price": closes[-1],
-                    "support": support,
-                    "resistance": resistance,
-                    "atr": atr,
-                    "price_change_pct": price_change,
-                    "volume_spike": volume_spike,
-                    "ma_20": ma_20,
-                    "ma_50": ma_50,
-                    "trend": "Bullish" if closes[-1] > ma_20 else "Bearish"
-                }
-            
-            return all_indicators
-            
-        except Exception as e:
-            logger.error(f"❌ Error calculating multi-TF indicators: {e}")
-            return None
-    
     def analyze_option_chain_advanced(self, oc_data, spot_price, symbol):
-        """
-        🆕 Advanced option chain analysis with OI change tracking
-        """
+        """Advanced option chain analysis with OI tracking"""
         try:
             oc = oc_data.get('oc', {})
             if not oc:
@@ -615,7 +501,7 @@ class AIOptionTradingBot:
                     'pe_vol': pe_vol
                 }
             
-            # 🆕 Track OI changes (last 5 snapshots in memory)
+            # Track OI changes
             timestamp = datetime.now().isoformat()
             
             if symbol not in self.oi_history:
@@ -667,11 +553,8 @@ class AIOptionTradingBot:
             return None
     
     async def get_simple_ai_analysis(self, symbol, candles, technical_data, option_data, spot_price):
-        """
-        🆕 Simplified GPT analysis (5-min only, faster)
-        """
+        """Simplified GPT analysis"""
         try:
-            # Recent 15 candles for pattern
             recent_candles = candles[-15:]
             candles_summary = [
                 {
@@ -753,112 +636,8 @@ class AIOptionTradingBot:
             logger.error(f"❌ Error in AI analysis: {e}")
             return None
     
-    async def get_advanced_ai_analysis(self, symbol, multi_tf_data, multi_tf_indicators, option_data, spot_price):
-        """
-        🆕 Enhanced GPT analysis with multi-TF context
-        """
-        try:
-            # Prepare multi-TF summary
-            tf_summary = ""
-            for tf, indicators in multi_tf_indicators.items():
-                tf_summary += f"\n**{tf.upper()} Timeframe:**\n"
-                tf_summary += f"- Trend: {indicators['trend']}\n"
-                tf_summary += f"- Price: ₹{indicators['current_price']:,.2f}\n"
-                tf_summary += f"- Support: ₹{indicators['support']:,.2f}, Resistance: ₹{indicators['resistance']:,.2f}\n"
-                tf_summary += f"- ATR: ₹{indicators['atr']:.2f}\n"
-                tf_summary += f"- Price Change: {indicators['price_change_pct']:.2f}%\n"
-                tf_summary += f"- Volume Spike: {indicators['volume_spike']:.2f}x\n"
-            
-            # Recent candles (5-min for entry timing)
-            recent_candles_5m = multi_tf_data.get('5min', [])[-10:]
-            candles_summary = []
-            for c in recent_candles_5m:
-                candles_summary.append({
-                    "open": c.get('open'),
-                    "high": c.get('high'),
-                    "low": c.get('low'),
-                    "close": c.get('close'),
-                    "volume": c.get('volume')
-                })
-            
-            prompt = f"""You are an expert option trader with multi-timeframe analysis expertise. Analyze {symbol}:
-
-**SPOT PRICE:** ₹{spot_price:,.2f}
-
-**MULTI-TIMEFRAME TECHNICAL ANALYSIS:**
-{tf_summary}
-
-**RECENT 10 CANDLES (5-min for precise entry):**
-{json.dumps(candles_summary[-10:], indent=2)}
-
-**OPTION CHAIN ANALYSIS:**
-- PCR Ratio: {option_data['pcr']:.2f} {"(Bullish)" if option_data['pcr'] > 1.2 else "(Bearish)" if option_data['pcr'] < 0.8 else "(Neutral)"}
-- ATM Strike: ₹{option_data['atm_strike']:,.0f}
-- Max CE OI: ₹{option_data['max_ce_oi_strike']:,.0f} (Resistance)
-- Max PE OI: ₹{option_data['max_pe_oi_strike']:,.0f} (Support)
-- CE Total OI: {option_data['ce_total_oi']:,}
-- PE Total OI: {option_data['pe_total_oi']:,}
-- ATM CE: ₹{option_data['atm_ce_price']:.2f} (IV: {option_data['atm_ce_iv']:.1f}%)
-- ATM PE: ₹{option_data['atm_pe_price']:.2f} (IV: {option_data['atm_pe_iv']:.1f}%)
-- OI Change (last 5 snapshots): {option_data['oi_change_pct']:.2f}%
-
-**ANALYSIS REQUIREMENTS:**
-1. Check if ALL timeframes align (5min, 15min, 1hour)
-2. Confirm with option chain (PCR, OI buildup)
-3. Only give signal if confidence ≥ 70%
-4. Minimum 1:2.5 risk-reward
-5. Use ATR for stop loss calculation
-
-**RESPOND IN THIS EXACT JSON FORMAT:**
-{{
-    "signal": "BUY_CE" or "BUY_PE" or "NO_TRADE",
-    "confidence": 0-100,
-    "entry_price": price,
-    "stop_loss": price,
-    "target": price,
-    "strike": strike_price,
-    "reasoning": "Multi-TF alignment + OI analysis summary (3-4 lines)",
-    "risk_reward": ratio,
-    "timeframe_alignment": "Strong/Moderate/Weak",
-    "key_levels": {{"support": price, "resistance": price}}
-}}
-
-**CRITICAL:**
-- NO TRADE if timeframes conflict
-- Prefer lower TF for entry timing
-- Higher TF for trend direction
-"""
-
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are an expert multi-timeframe option trader. Respond ONLY with valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_tokens=600
-            )
-            
-            ai_response = response.choices[0].message.content.strip()
-            
-            if ai_response.startswith("```"):
-                ai_response = ai_response.split("```")[1]
-                if ai_response.startswith("json"):
-                    ai_response = ai_response[4:]
-                ai_response = ai_response.strip()
-            
-            signal_data = json.loads(ai_response)
-            
-            logger.info(f"🤖 AI Signal for {symbol}: {signal_data.get('signal')} | Confidence: {signal_data.get('confidence')}% | TF Alignment: {signal_data.get('timeframe_alignment')}")
-            
-            return signal_data
-            
-        except Exception as e:
-            logger.error(f"❌ Error in AI analysis: {e}")
-            return None
-    
     def format_signal_message(self, symbol, signal_data, spot_price, expiry, technical_data):
-        """Format trading signal for Telegram (Simplified)"""
+        """Format trading signal for Telegram"""
         try:
             signal_type = signal_data.get('signal')
             
@@ -899,65 +678,8 @@ class AIOptionTradingBot:
             logger.error(f"❌ Error formatting signal: {e}")
             return None
     
-    def format_advanced_signal(self, symbol, signal_data, spot_price, expiry, multi_tf_indicators):
-        """
-        🆕 Enhanced signal formatting
-        """
-        try:
-            signal_type = signal_data.get('signal')
-            
-            if signal_type == "NO_TRADE":
-                return None
-            
-            confidence = signal_data.get('confidence', 0)
-            signal_emoji = "🟢 BUY CALL" if signal_type == "BUY_CE" else "🔴 BUY PUT"
-            
-            msg = f"{signal_emoji}\n"
-            msg += f"━━━━━━━━━━━━━━━━━━━━\n"
-            msg += f"*{symbol}*\n"
-            msg += f"Spot: ₹{spot_price:,.2f}\n"
-            msg += f"Expiry: {expiry}\n\n"
-            
-            msg += f"*📊 Multi-TF Analysis:*\n"
-            for tf, ind in multi_tf_indicators.items():
-                msg += f"{tf}: {ind['trend']} ({ind['price_change_pct']:+.2f}%)\n"
-            msg += f"Alignment: {signal_data.get('timeframe_alignment', 'N/A')}\n\n"
-            
-            msg += f"*💰 Trade Setup:*\n"
-            msg += f"Strike: ₹{signal_data.get('strike', 0):,.0f}\n"
-            msg += f"Entry: ₹{signal_data.get('entry_price', 0):.2f}\n"
-            msg += f"SL: ₹{signal_data.get('stop_loss', 0):.2f}\n"
-            msg += f"Target: ₹{signal_data.get('target', 0):.2f}\n"
-            msg += f"R:R = 1:{signal_data.get('risk_reward', 0):.2f}\n\n"
-            
-            msg += f"*🎯 Confidence:* {confidence}%\n\n"
-            
-            key_levels = signal_data.get('key_levels', {})
-            if key_levels:
-                msg += f"*📍 Key Levels:*\n"
-                msg += f"Support: ₹{key_levels.get('support', 0):,.2f}\n"
-                msg += f"Resistance: ₹{key_levels.get('resistance', 0):,.2f}\n\n"
-            
-            msg += f"*💡 Analysis:*\n_{signal_data.get('reasoning', 'N/A')}_\n\n"
-            
-            msg += f"*⚠️ Risk Management:*\n"
-            msg += f"• Position size: 2-3% of capital\n"
-            msg += f"• Exit at SL (No averaging)\n"
-            msg += f"• Book 50% at 1:1.5, trail rest\n"
-            msg += f"• No expiry day trading\n\n"
-            
-            msg += f"🕒 {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
-            
-            return msg
-            
-        except Exception as e:
-            logger.error(f"❌ Error formatting signal: {e}")
-            return None
-    
     async def analyze_and_send_signals(self, symbols_batch):
-        """
-        🆕 Enhanced analysis with multi-TF + auto expiry
-        """
+        """Enhanced analysis with API-based expiry"""
         for symbol in symbols_batch:
             try:
                 if symbol not in self.security_id_map:
@@ -970,11 +692,18 @@ class AIOptionTradingBot:
                 
                 logger.info(f"📊 Analyzing {symbol} ({symbol_type})...")
                 
-                # 🆕 Use fallback expiry (skip API call for faster execution)
-                expiry = self.get_fallback_expiry(symbol, symbol_type)
+                # Use actual API expiry
+                expiry = self.update_expiry_for_symbol(symbol, security_id, segment, symbol_type)
+                if not expiry:
+                    logger.warning(f"⚠️ {symbol}: Could not determine expiry, skipping...")
+                    await asyncio.sleep(2)
+                    continue
                 logger.info(f"📅 {symbol}: Using expiry: {expiry}")
                 
-                # 🆕 5-min candle data
+                # Small delay after expiry API call
+                await asyncio.sleep(1)
+                
+                # Get 5-min candle data
                 candle_data = await self.get_multi_timeframe_data(security_id, segment)
                 if not candle_data or '5min' not in candle_data:
                     logger.warning(f"⚠️ {symbol}: No candle data")
@@ -987,7 +716,7 @@ class AIOptionTradingBot:
                 
                 logger.info(f"✅ Got {len(candles_5min)} candles")
                 
-                # 🆕 Technical indicators (5-min only)
+                # Technical indicators
                 technical_data = self.calculate_technical_indicators(candles_5min)
                 if not technical_data:
                     continue
@@ -995,7 +724,7 @@ class AIOptionTradingBot:
                 spot_price = technical_data['current_price']
                 logger.info(f"📈 Technical analysis done. Spot: ₹{spot_price:,.2f}")
                 
-                # 🆕 Option chain with rate limit + debug
+                # Option chain with rate limit
                 logger.info(f"🔍 Fetching option chain for {symbol} (Expiry: {expiry})...")
                 oc_data = await self.get_option_chain_safe(security_id, segment, expiry)
                 if not oc_data:
@@ -1005,14 +734,14 @@ class AIOptionTradingBot:
                 
                 logger.info(f"✅ Option chain fetched")
                 
-                # 🆕 Advanced OI analysis
+                # Advanced OI analysis
                 option_analysis = self.analyze_option_chain_advanced(oc_data, spot_price, symbol)
                 if not option_analysis:
                     continue
                 
                 logger.info(f"📊 OI Analysis: PCR={option_analysis['pcr']:.2f} | OI Change={option_analysis['oi_change_pct']:+.2f}% | Snapshots={option_analysis['oi_snapshots']}")
                 
-                # 🆕 Simplified GPT analysis (5-min only)
+                # GPT analysis
                 signal_data = await self.get_simple_ai_analysis(
                     symbol, candles_5min, technical_data, option_analysis, spot_price
                 )
@@ -1041,58 +770,66 @@ class AIOptionTradingBot:
                 logger.error(f"❌ Error processing {symbol}: {e}")
                 await asyncio.sleep(3)
     
-    async def run(self):
-        """
-        🆕 Main bot loop with intelligent batching
-        """
-        logger.info("🚀 Advanced AI Option Trading Bot starting...")
+    def is_market_hours(self):
+        """Check if market is open (9:15 AM - 3:30 PM, Mon-Fri)"""
+        now = datetime.now()
         
-        success = await self.load_security_ids()
-        if not success:
-            logger.error("❌ Failed to load security IDs. Exiting...")
-            return
+        # Weekend check
+        if now.weekday() >= 5:
+            return False
         
-        await self.send_startup_message()
+        # Time check
+        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
         
-        # Separate indices and stocks
-        indices = [s for s, info in self.security_id_map.items() if info['type'] == 'index']
-        stocks = [s for s, info in self.security_id_map.items() if info['type'] == 'stock']
-        
-        logger.info(f"📊 {len(indices)} Indices | {len(stocks)} Stocks")
-        
-        # 🆕 IMMEDIATE FIRST SCAN (No expiry wait!)
-        logger.info("🔥 IMMEDIATE SCAN: Starting first analysis cycle...")
-        await self.perform_analysis_cycle(indices, stocks, cycle_num=1)
-        logger.info("✅ Initial scan completed!")
-        
-        cycle_count = 1
-        
-        while self.running:
-            try:
-                cycle_count += 1
-                
-                logger.info(f"⏳ Waiting 5 minutes before next cycle...")
-                await asyncio.sleep(300)
-                
-                timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-                logger.info(f"🔄 Cycle #{cycle_count} started at {timestamp}")
-                
-                await self.perform_analysis_cycle(indices, stocks, cycle_count)
-                
-            except KeyboardInterrupt:
-                logger.info("🛑 Bot stopped by user")
-                self.running = False
-                break
-            except Exception as e:
-                logger.error(f"❌ Error in main loop: {e}")
-                await asyncio.sleep(60)
+        return market_open <= now <= market_close
+    
+    async def send_startup_message(self):
+        """Enhanced startup message"""
+        try:
+            indices_count = len([s for s, info in self.security_id_map.items() if info['type'] == 'index'])
+            stocks_count = len([s for s, info in self.security_id_map.items() if info['type'] == 'stock'])
+            
+            msg = "🚀 *Advanced AI Option Trading Bot Started!*\n\n"
+            msg += "🤖 *Powered by GPT-4o-mini*\n\n"
+            
+            msg += "*📊 Coverage:*\n"
+            msg += f"• {indices_count} Indices (Weekly expiry)\n"
+            msg += f"• {stocks_count} Stocks (Monthly expiry)\n\n"
+            
+            msg += "*🎯 Features:*\n"
+            msg += "✅ 5-Min Timeframe Analysis\n"
+            msg += "✅ Auto Expiry Selection (API-based)\n"
+            msg += "✅ OI Change Tracking (5 snapshots)\n"
+            msg += "✅ Rate Limit Protection\n"
+            msg += "✅ PCR + Greeks Analysis\n\n"
+            
+            msg += "*⚙️ Settings:*\n"
+            msg += "• Cycle: Every 5 minutes\n"
+            msg += "• Min Confidence: 70%\n"
+            msg += "• Min R:R: 1:2.5\n"
+            msg += "• Position Size: 2-3% capital\n\n"
+            
+            msg += "*📅 Expiry Logic:*\n"
+            msg += "• Indices: Nearest weekly\n"
+            msg += "• Stocks: Nearest monthly (day >= 20)\n\n"
+            
+            msg += "⚠️ *Disclaimer:* Educational purposes only. Trade at your own risk.\n\n"
+            msg += "_Market Hours: 9:15 AM - 3:30 PM (Mon-Fri)_"
+            
+            await self.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=msg,
+                parse_mode='Markdown'
+            )
+            logger.info("✅ Startup message sent")
+        except Exception as e:
+            logger.error(f"❌ Error sending startup message: {e}")
     
     async def perform_analysis_cycle(self, indices, stocks, cycle_num):
-        """
-        🆕 Separate function for analysis cycle (reusable for immediate scan)
-        """
+        """Separate function for analysis cycle"""
         try:
-            # 🆕 Market time check
+            # Market time check
             if not self.is_market_hours():
                 logger.warning("⚠️ Market is CLOSED! Running in test mode with limited data...")
             
@@ -1122,65 +859,49 @@ class AIOptionTradingBot:
             logger.error(f"❌ Error in analysis cycle: {e}")
             raise
     
-    def is_market_hours(self):
-        """
-        🆕 Check if market is open (9:15 AM - 3:30 PM, Mon-Fri)
-        """
-        now = datetime.now()
+    async def run(self):
+        """Main bot loop with intelligent batching"""
+        logger.info("🚀 Advanced AI Option Trading Bot starting...")
         
-        # Weekend check
-        if now.weekday() >= 5:  # Saturday=5, Sunday=6
-            return False
+        success = await self.load_security_ids()
+        if not success:
+            logger.error("❌ Failed to load security IDs. Exiting...")
+            return
         
-        # Time check
-        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        await self.send_startup_message()
         
-        return market_open <= now <= market_close
-    
-    async def send_startup_message(self):
-        """
-        🆕 Enhanced startup message
-        """
-        try:
-            indices_count = len([s for s, info in self.security_id_map.items() if info['type'] == 'index'])
-            stocks_count = len([s for s, info in self.security_id_map.items() if info['type'] == 'stock'])
-            
-            msg = "🚀 *Advanced AI Option Trading Bot Started!*\n\n"
-            msg += "🤖 *Powered by GPT-4o-mini*\n\n"
-            
-            msg += "*📊 Coverage:*\n"
-            msg += f"• {indices_count} Indices (Weekly expiry)\n"
-            msg += f"• {stocks_count} Stocks (Monthly expiry)\n\n"
-            
-            msg += "*🎯 Features:*\n"
-            msg += "✅ Multi-Timeframe Analysis (5m, 15m, 1h)\n"
-            msg += "✅ Auto Expiry Rollover\n"
-            msg += "✅ OI Change Tracking (5 snapshots)\n"
-            msg += "✅ Rate Limit Protection\n"
-            msg += "✅ PCR + Greeks Analysis\n\n"
-            
-            msg += "*⚙️ Settings:*\n"
-            msg += "• Cycle: Every 5 minutes\n"
-            msg += "• Min Confidence: 70%\n"
-            msg += "• Min R:R: 1:2.5\n"
-            msg += "• Position Size: 2-3% capital\n\n"
-            
-            msg += "*📅 Expiry Logic:*\n"
-            msg += "• Indices: Nearest weekly\n"
-            msg += "• Stocks: Nearest monthly\n\n"
-            
-            msg += "⚠️ *Disclaimer:* Educational purposes only. Trade at your own risk.\n\n"
-            msg += "_Market Hours: 9:15 AM - 3:30 PM (Mon-Fri)_"
-            
-            await self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode='Markdown'
-            )
-            logger.info("✅ Startup message sent")
-        except Exception as e:
-            logger.error(f"❌ Error sending startup message: {e}")
+        # Separate indices and stocks
+        indices = [s for s, info in self.security_id_map.items() if info['type'] == 'index']
+        stocks = [s for s, info in self.security_id_map.items() if info['type'] == 'stock']
+        
+        logger.info(f"📊 {len(indices)} Indices | {len(stocks)} Stocks")
+        
+        # IMMEDIATE FIRST SCAN
+        logger.info("🔥 IMMEDIATE SCAN: Starting first analysis cycle...")
+        await self.perform_analysis_cycle(indices, stocks, cycle_num=1)
+        logger.info("✅ Initial scan completed!")
+        
+        cycle_count = 1
+        
+        while self.running:
+            try:
+                cycle_count += 1
+                
+                logger.info(f"⏳ Waiting 5 minutes before next cycle...")
+                await asyncio.sleep(300)
+                
+                timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+                logger.info(f"🔄 Cycle #{cycle_count} started at {timestamp}")
+                
+                await self.perform_analysis_cycle(indices, stocks, cycle_count)
+                
+            except KeyboardInterrupt:
+                logger.info("🛑 Bot stopped by user")
+                self.running = False
+                break
+            except Exception as e:
+                logger.error(f"❌ Error in main loop: {e}")
+                await asyncio.sleep(60)
 
 
 # ========================
