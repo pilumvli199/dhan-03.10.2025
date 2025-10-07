@@ -148,7 +148,7 @@ class AIOptionTradingBot:
             logger.error(f"❌ Error loading security IDs: {e}")
             return False
     
-    def get_multi_timeframe_data(self, security_id, segment):
+    async def get_multi_timeframe_data(self, security_id, segment):
         """
         🆕 Get candle data for multiple timeframes
         Returns: {5min, 15min, 1hour} data
