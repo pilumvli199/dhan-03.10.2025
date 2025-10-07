@@ -668,3 +668,11 @@ Respond with JSON ONLY, no other text.
 """
 
             response = ai_client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert options trader. Always respond with valid JSON only. Use OPTION PREMIUMS, never stock prices for entry/SL/target."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=600
+            )
