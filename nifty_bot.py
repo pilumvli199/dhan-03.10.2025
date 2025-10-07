@@ -25,8 +25,22 @@ DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# OpenAI Client
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# Configuration - Choose AI Provider
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai")  # "openai" or "groq"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# Initialize AI Client based on provider
+if AI_PROVIDER == "groq":
+    from groq import Groq
+    ai_client = Groq(api_key=GROQ_API_KEY)
+    AI_MODEL = "llama-3.1-70b-versatile"  # Free & fast
+    logger.info("🤖 Using Groq (FREE)")
+else:
+    from openai import OpenAI
+    ai_client = OpenAI(api_key=OPENAI_API_KEY)
+    AI_MODEL = "gpt-4o-mini"
+    logger.info("🤖 Using OpenAI")
 
 # Dhan API URLs
 DHAN_API_BASE = "https://api.dhan.co"
@@ -575,8 +589,8 @@ class AIOptionTradingBot:
 **Rules:** Min confidence 70%, Min R:R 1:2.5
 """
 
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+            response = ai_client.chat.completions.create(
+                model=AI_MODEL,
                 messages=[
                     {"role": "system", "content": "Expert trader. JSON only."},
                     {"role": "user", "content": prompt}
@@ -584,16 +598,30 @@ class AIOptionTradingBot:
                 temperature=0.2,
                 max_tokens=500
             )
+            )
             
             ai_response = response.choices[0].message.content.strip()
             
+            # Clean response - remove markdown, extra text
             if ai_response.startswith("```"):
                 ai_response = ai_response.split("```")[1]
                 if ai_response.startswith("json"):
                     ai_response = ai_response[4:]
                 ai_response = ai_response.strip()
             
-            signal_data = json.loads(ai_response)
+            # Extract JSON from response (in case GPT added extra text)
+            import re
+            json_match = re.search(r'\{.*\}', ai_response, re.DOTALL)
+            if json_match:
+                ai_response = json_match.group(0)
+            
+            # Parse JSON
+            try:
+                signal_data = json.loads(ai_response)
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ JSON parse error: {e}")
+                logger.error(f"❌ Raw response: {ai_response[:200]}")
+                return None
             
             logger.info(f"🤖 Signal: {signal_data.get('signal')} | Confidence: {signal_data.get('confidence')}%")
             
