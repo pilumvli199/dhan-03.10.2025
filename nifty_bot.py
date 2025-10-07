@@ -150,86 +150,59 @@ class AIOptionTradingBot:
     
     async def get_multi_timeframe_data(self, security_id, segment):
         """
-        🆕 Get candle data for multiple timeframes
-        Returns: {5min, 15min, 1hour} data
+        🆕 Simplified: Only 5-min timeframe (faster & reliable)
         """
         try:
-            timeframes = {
-                '5': 90,   # Last 90 candles (5-min)
-                '15': 60,  # Last 60 candles (15-min)
-                '60': 30   # Last 30 candles (1-hour)
+            from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d 09:15:00")
+            to_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            payload = {
+                "securityId": str(security_id),
+                "exchangeSegment": segment,
+                "instrument": "EQUITY" if segment == "NSE_EQ" else "INDEX",
+                "interval": "5",
+                "fromDate": from_date,
+                "toDate": to_date
             }
             
-            multi_tf_data = {}
+            logger.info(f"📡 Fetching 5min data...")
             
-            for interval, limit in timeframes.items():
-                from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d 09:15:00")
-                to_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            response = requests.post(
+                DHAN_INTRADAY_URL,
+                json=payload,
+                headers=self.headers,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
                 
-                payload = {
-                    "securityId": str(security_id),
-                    "exchangeSegment": segment,
-                    "instrument": "EQUITY" if segment == "NSE_EQ" else "INDEX",
-                    "interval": interval,
-                    "fromDate": from_date,
-                    "toDate": to_date
-                }
-                
-                logger.info(f"📡 Fetching {interval}min data - Payload: {payload}")
-                
-                response = requests.post(
-                    DHAN_INTRADAY_URL,
-                    json=payload,
-                    headers=self.headers,
-                    timeout=15
-                )
-                
-                logger.info(f"📦 {interval}min API Status: {response.status_code}")
-                
-                if response.status_code == 200:
-                    data = response.json()
+                if isinstance(data, dict) and 'open' in data and isinstance(data['open'], list):
+                    candles = []
+                    length = len(data['open'])
+                    logger.info(f"✅ Got {length} candles")
                     
-                    # Log response structure
-                    if isinstance(data, dict):
-                        logger.info(f"📊 {interval}min Response keys: {data.keys()}")
-                        
-                        if 'open' in data and isinstance(data['open'], list):
-                            # Array format
-                            candles = []
-                            length = len(data['open'])
-                            logger.info(f"✅ {interval}min: Got {length} candles (array format)")
-                            
-                            for i in range(length):
-                                candles.append({
-                                    'open': data['open'][i],
-                                    'high': data['high'][i],
-                                    'low': data['low'][i],
-                                    'close': data['close'][i],
-                                    'volume': data['volume'][i],
-                                    'timestamp': data.get('timestamp', [0]*length)[i]
-                                })
-                            multi_tf_data[f'{interval}min'] = candles[-limit:]
-                        elif 'data' in data:
-                            candles = data['data']
-                            logger.info(f"✅ {interval}min: Got {len(candles)} candles (data format)")
-                            multi_tf_data[f'{interval}min'] = candles[-limit:]
-                        else:
-                            logger.warning(f"⚠️ {interval}min: Unknown response format - {list(data.keys())[:3]}")
-                    else:
-                        logger.warning(f"⚠️ {interval}min: Response is not dict - Type: {type(data)}")
-                else:
-                    logger.error(f"❌ {interval}min API failed: {response.status_code} - {response.text[:200]}")
+                    for i in range(length):
+                        candles.append({
+                            'open': data['open'][i],
+                            'high': data['high'][i],
+                            'low': data['low'][i],
+                            'close': data['close'][i],
+                            'volume': data['volume'][i],
+                            'timestamp': data.get('timestamp', [0]*length)[i]
+                        })
+                    
+                    # Return in dict format for compatibility
+                    return {'5min': candles[-100:]}  # Last 100 candles
                 
-                await asyncio.sleep(0.5)  # Small delay between TF requests
+                logger.warning(f"⚠️ Unexpected response format")
+            else:
+                logger.error(f"❌ API failed: {response.status_code}")
             
-            logger.info(f"📈 Multi-TF Summary: {len(multi_tf_data)}/3 timeframes loaded - {list(multi_tf_data.keys())}")
-            
-            return multi_tf_data if len(multi_tf_data) == 3 else None
+            return None
             
         except Exception as e:
-            logger.error(f"❌ Error getting multi-TF data: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Error getting candle data: {e}")
             return None
     
     def get_all_expiries(self, security_id, segment):
@@ -425,8 +398,7 @@ class AIOptionTradingBot:
     
     async def get_option_chain_safe(self, security_id, segment, expiry):
         """
-        🆕 Rate-limit safe option chain fetch
-        3 second minimum gap between calls
+        🆕 Rate-limit safe option chain fetch with detailed logging
         """
         try:
             import time
@@ -444,6 +416,8 @@ class AIOptionTradingBot:
                 "Expiry": expiry
             }
             
+            logger.info(f"📡 Option Chain Request - Payload: {payload}")
+            
             response = requests.post(
                 DHAN_OPTION_CHAIN_URL,
                 json=payload,
@@ -453,15 +427,69 @@ class AIOptionTradingBot:
             
             self.last_option_chain_call = time.time()
             
+            logger.info(f"📦 Option Chain Status: {response.status_code}")
+            
             if response.status_code == 200:
                 data = response.json()
+                logger.info(f"📊 Response keys: {data.keys() if isinstance(data, dict) else 'Not a dict'}")
+                
                 if data.get('data'):
+                    logger.info(f"✅ Option chain data received")
                     return data['data']
+                else:
+                    logger.warning(f"⚠️ No 'data' key in response: {data}")
+            else:
+                logger.error(f"❌ Option Chain API failed: {response.status_code} - {response.text[:200]}")
             
             return None
             
         except Exception as e:
             logger.error(f"❌ Error getting option chain: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+    
+    def calculate_technical_indicators(self, candles):
+        """Calculate key technical indicators from 5-min candles"""
+        try:
+            closes = [float(c['close']) for c in candles]
+            highs = [float(c['high']) for c in candles]
+            lows = [float(c['low']) for c in candles]
+            volumes = [float(c['volume']) for c in candles]
+            
+            recent_highs = highs[-20:]
+            recent_lows = lows[-20:]
+            
+            resistance = max(recent_highs)
+            support = min(recent_lows)
+            
+            tr_list = []
+            for i in range(1, min(15, len(candles))):
+                high_low = highs[i] - lows[i]
+                high_close = abs(highs[i] - closes[i-1])
+                low_close = abs(lows[i] - closes[i-1])
+                tr = max(high_low, high_close, low_close)
+                tr_list.append(tr)
+            
+            atr = sum(tr_list) / len(tr_list) if tr_list else 0
+            price_change_pct = ((closes[-1] - closes[0]) / closes[0]) * 100
+            
+            avg_volume = sum(volumes[-20:]) / 20
+            current_volume = volumes[-1]
+            volume_spike = (current_volume / avg_volume) if avg_volume > 0 else 1
+            
+            return {
+                "current_price": closes[-1],
+                "support": support,
+                "resistance": resistance,
+                "atr": atr,
+                "price_change_pct": price_change_pct,
+                "volume_spike": volume_spike,
+                "avg_volume": avg_volume
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error calculating indicators: {e}")
             return None
     
     def calculate_multi_tf_indicators(self, multi_tf_data):
@@ -638,6 +666,93 @@ class AIOptionTradingBot:
             logger.error(f"❌ Error analyzing option chain: {e}")
             return None
     
+    async def get_simple_ai_analysis(self, symbol, candles, technical_data, option_data, spot_price):
+        """
+        🆕 Simplified GPT analysis (5-min only, faster)
+        """
+        try:
+            # Recent 15 candles for pattern
+            recent_candles = candles[-15:]
+            candles_summary = [
+                {
+                    "open": c.get('open'),
+                    "high": c.get('high'),
+                    "low": c.get('low'),
+                    "close": c.get('close'),
+                    "volume": c.get('volume')
+                }
+                for c in recent_candles
+            ]
+            
+            prompt = f"""Expert option trader analyzing {symbol}. Provide trading signal:
+
+**Spot Price:** ₹{spot_price:,.2f}
+
+**5-Min Technical (Last 100 candles):**
+- Support: ₹{technical_data['support']:,.2f}
+- Resistance: ₹{technical_data['resistance']:,.2f}
+- ATR: ₹{technical_data['atr']:.2f}
+- Price Change: {technical_data['price_change_pct']:.2f}%
+- Volume Spike: {technical_data['volume_spike']:.2f}x
+
+**Recent 15 Candles:**
+{json.dumps(candles_summary, indent=2)}
+
+**Option Chain:**
+- PCR: {option_data['pcr']:.2f}
+- ATM Strike: ₹{option_data['atm_strike']:,.0f}
+- Max CE OI Strike: ₹{option_data.get('max_ce_oi_strike', 0):,.0f}
+- Max PE OI Strike: ₹{option_data.get('max_pe_oi_strike', 0):,.0f}
+- CE OI: {option_data['ce_total_oi']:,} | PE OI: {option_data['pe_total_oi']:,}
+- ATM CE: ₹{option_data['atm_ce_price']:.2f} (IV: {option_data['atm_ce_iv']:.1f}%)
+- ATM PE: ₹{option_data['atm_pe_price']:.2f} (IV: {option_data['atm_pe_iv']:.1f}%)
+
+**Task:** Respond in JSON:
+{{
+    "signal": "BUY_CE" or "BUY_PE" or "NO_TRADE",
+    "confidence": 0-100,
+    "entry_price": price,
+    "stop_loss": price,
+    "target": price,
+    "strike": strike_price,
+    "reasoning": "brief (2-3 lines)",
+    "risk_reward": ratio
+}}
+
+**Rules:**
+- Signal only if confidence ≥ 70%
+- Min R:R 1:2.5
+- Consider price action + OI data
+"""
+
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Expert option trader. Respond ONLY with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=500
+            )
+            
+            ai_response = response.choices[0].message.content.strip()
+            
+            if ai_response.startswith("```"):
+                ai_response = ai_response.split("```")[1]
+                if ai_response.startswith("json"):
+                    ai_response = ai_response[4:]
+                ai_response = ai_response.strip()
+            
+            signal_data = json.loads(ai_response)
+            
+            logger.info(f"🤖 AI Signal: {signal_data.get('signal')} | Confidence: {signal_data.get('confidence')}%")
+            
+            return signal_data
+            
+        except Exception as e:
+            logger.error(f"❌ Error in AI analysis: {e}")
+            return None
+    
     async def get_advanced_ai_analysis(self, symbol, multi_tf_data, multi_tf_indicators, option_data, spot_price):
         """
         🆕 Enhanced GPT analysis with multi-TF context
@@ -742,6 +857,48 @@ class AIOptionTradingBot:
             logger.error(f"❌ Error in AI analysis: {e}")
             return None
     
+    def format_signal_message(self, symbol, signal_data, spot_price, expiry, technical_data):
+        """Format trading signal for Telegram (Simplified)"""
+        try:
+            signal_type = signal_data.get('signal')
+            
+            if signal_type == "NO_TRADE":
+                return None
+            
+            confidence = signal_data.get('confidence', 0)
+            signal_emoji = "🟢 BUY CALL" if signal_type == "BUY_CE" else "🔴 BUY PUT"
+            
+            msg = f"{signal_emoji}\n"
+            msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+            msg += f"*{symbol}*\n"
+            msg += f"Spot: ₹{spot_price:,.2f}\n"
+            msg += f"Expiry: {expiry}\n\n"
+            
+            msg += f"*💰 Trade Setup:*\n"
+            msg += f"Strike: ₹{signal_data.get('strike', 0):,.0f}\n"
+            msg += f"Entry: ₹{signal_data.get('entry_price', 0):.2f}\n"
+            msg += f"SL: ₹{signal_data.get('stop_loss', 0):.2f}\n"
+            msg += f"Target: ₹{signal_data.get('target', 0):.2f}\n"
+            msg += f"R:R = 1:{signal_data.get('risk_reward', 0):.2f}\n\n"
+            
+            msg += f"*🎯 Confidence:* {confidence}%\n\n"
+            
+            msg += f"*📍 Key Levels:*\n"
+            msg += f"Support: ₹{technical_data['support']:,.2f}\n"
+            msg += f"Resistance: ₹{technical_data['resistance']:,.2f}\n\n"
+            
+            msg += f"*💡 Analysis:*\n_{signal_data.get('reasoning', 'N/A')}_\n\n"
+            
+            msg += f"*⚠️ Risk:* 2-3% capital | Exit at SL\n\n"
+            
+            msg += f"🕒 {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
+            
+            return msg
+            
+        except Exception as e:
+            logger.error(f"❌ Error formatting signal: {e}")
+            return None
+    
     def format_advanced_signal(self, symbol, signal_data, spot_price, expiry, multi_tf_indicators):
         """
         🆕 Enhanced signal formatting
@@ -817,29 +974,36 @@ class AIOptionTradingBot:
                 expiry = self.get_fallback_expiry(symbol, symbol_type)
                 logger.info(f"📅 {symbol}: Using expiry: {expiry}")
                 
-                # 🆕 Multi-timeframe data
-                multi_tf_data = await self.get_multi_timeframe_data(security_id, segment)
-                if not multi_tf_data or len(multi_tf_data) < 3:
-                    logger.warning(f"⚠️ {symbol}: Insufficient multi-TF data")
+                # 🆕 5-min candle data
+                candle_data = await self.get_multi_timeframe_data(security_id, segment)
+                if not candle_data or '5min' not in candle_data:
+                    logger.warning(f"⚠️ {symbol}: No candle data")
                     continue
                 
-                logger.info(f"✅ Got data for {len(multi_tf_data)} timeframes")
-                
-                # 🆕 Multi-TF indicators
-                multi_tf_indicators = self.calculate_multi_tf_indicators(multi_tf_data)
-                if not multi_tf_indicators:
+                candles_5min = candle_data['5min']
+                if len(candles_5min) < 50:
+                    logger.warning(f"⚠️ {symbol}: Insufficient candles ({len(candles_5min)})")
                     continue
                 
-                spot_price = multi_tf_indicators['5min']['current_price']
-                logger.info(f"📈 Technical analysis complete. Spot: ₹{spot_price:,.2f}")
+                logger.info(f"✅ Got {len(candles_5min)} candles")
                 
-                # 🆕 Option chain with rate limit
+                # 🆕 Technical indicators (5-min only)
+                technical_data = self.calculate_technical_indicators(candles_5min)
+                if not technical_data:
+                    continue
+                
+                spot_price = technical_data['current_price']
+                logger.info(f"📈 Technical analysis done. Spot: ₹{spot_price:,.2f}")
+                
+                # 🆕 Option chain with rate limit + debug
+                logger.info(f"🔍 Fetching option chain for {symbol} (Expiry: {expiry})...")
                 oc_data = await self.get_option_chain_safe(security_id, segment, expiry)
                 if not oc_data:
                     logger.warning(f"⚠️ {symbol}: No option chain data")
+                    await asyncio.sleep(3)
                     continue
                 
-                logger.info(f"✅ Option chain fetched (Expiry: {expiry})")
+                logger.info(f"✅ Option chain fetched")
                 
                 # 🆕 Advanced OI analysis
                 option_analysis = self.analyze_option_chain_advanced(oc_data, spot_price, symbol)
@@ -848,20 +1012,19 @@ class AIOptionTradingBot:
                 
                 logger.info(f"📊 OI Analysis: PCR={option_analysis['pcr']:.2f} | OI Change={option_analysis['oi_change_pct']:+.2f}% | Snapshots={option_analysis['oi_snapshots']}")
                 
-                # 🆕 Advanced GPT analysis
-                signal_data = await self.get_advanced_ai_analysis(
-                    symbol, multi_tf_data, multi_tf_indicators, option_analysis, spot_price
+                # 🆕 Simplified GPT analysis (5-min only)
+                signal_data = await self.get_simple_ai_analysis(
+                    symbol, candles_5min, technical_data, option_analysis, spot_price
                 )
                 
                 if not signal_data:
                     logger.warning(f"⚠️ {symbol}: AI analysis failed")
+                    await asyncio.sleep(3)
                     continue
                 
                 # Send signal if confidence >= 70%
                 if signal_data.get('signal') != 'NO_TRADE' and signal_data.get('confidence', 0) >= 70:
-                    message = self.format_advanced_signal(
-                        symbol, signal_data, spot_price, expiry, multi_tf_indicators
-                    )
+                    message = self.format_signal_message(symbol, signal_data, spot_price, expiry, technical_data)
                     if message:
                         await self.bot.send_message(
                             chat_id=TELEGRAM_CHAT_ID,
