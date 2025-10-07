@@ -665,3 +665,6 @@ If recommending BUY_CE with ATM strike ₹{option_data['atm_strike']:,.0f}:
 - DO NOT use stock/index prices like ₹{spot_price:,.2f}
 
 Respond with JSON ONLY, no other text.
+"""
+
+            response = ai_client.chat.completions.create(
