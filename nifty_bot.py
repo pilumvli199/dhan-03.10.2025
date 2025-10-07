@@ -214,13 +214,15 @@ class AIOptionTradingBot:
     
     def get_all_expiries(self, security_id, segment):
         """
-        🆕 Get ALL expiries for a symbol
+        🆕 Get ALL expiries for a symbol with detailed logging
         """
         try:
             payload = {
                 "UnderlyingScrip": security_id,
                 "UnderlyingSeg": segment
             }
+            
+            logger.info(f"🔍 Fetching expiries - Payload: {payload}")
             
             response = requests.post(
                 DHAN_EXPIRY_LIST_URL,
@@ -229,15 +231,27 @@ class AIOptionTradingBot:
                 timeout=10
             )
             
+            logger.info(f"📡 Expiry API Status: {response.status_code}")
+            
             if response.status_code == 200:
                 data = response.json()
+                logger.info(f"📦 Expiry Response: {data}")
+                
                 if data.get('status') == 'success' and data.get('data'):
-                    return data['data']
+                    expiries = data['data']
+                    logger.info(f"✅ Found {len(expiries)} expiries: {expiries[:3]}...")
+                    return expiries
+                else:
+                    logger.warning(f"⚠️ Expiry response format issue: {data}")
+            else:
+                logger.error(f"❌ Expiry API failed: {response.status_code} - {response.text}")
             
             return []
             
         except Exception as e:
             logger.error(f"❌ Error getting expiry list: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
     
     def select_best_expiry(self, symbol, expiry_list, symbol_type):
@@ -286,18 +300,89 @@ class AIOptionTradingBot:
             logger.error(f"❌ Error selecting expiry: {e}")
             return None
     
+    def get_fallback_expiry(self, symbol, symbol_type):
+        """
+        🆕 Quick fallback expiry calculation (no API call needed)
+        """
+        try:
+            today = datetime.now().date()
+            
+            if symbol_type == 'index':
+                # Weekly expiry - next Thursday
+                days_ahead = 3 - today.weekday()  # Thursday = 3
+                if days_ahead <= 0:
+                    days_ahead += 7
+                expiry_date = today + timedelta(days=days_ahead)
+            else:
+                # Monthly expiry - last Thursday of current month
+                import calendar
+                last_day = calendar.monthrange(today.year, today.month)[1]
+                last_date = datetime(today.year, today.month, last_day).date()
+                
+                # Find last Thursday
+                days_back = (last_date.weekday() - 3) % 7
+                expiry_date = last_date - timedelta(days=days_back)
+                
+                # If already passed, use next month
+                if expiry_date < today:
+                    next_month = today.month + 1 if today.month < 12 else 1
+                    next_year = today.year if today.month < 12 else today.year + 1
+                    last_day_next = calendar.monthrange(next_year, next_month)[1]
+                    last_date_next = datetime(next_year, next_month, last_day_next).date()
+                    days_back = (last_date_next.weekday() - 3) % 7
+                    expiry_date = last_date_next - timedelta(days=days_back)
+            
+            return expiry_date.strftime('%Y-%m-%d')
+            
+        except Exception as e:
+            logger.error(f"❌ Error calculating fallback expiry: {e}")
+            # Ultimate fallback
+            return (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+    
     def update_expiry_for_symbol(self, symbol, security_id, segment, symbol_type):
         """
-        🆕 Update expiry with auto-rollover logic
+        🆕 Update expiry with auto-rollover logic + fallback
         """
         try:
             # Get all expiries
             expiry_list = self.get_all_expiries(security_id, segment)
             
             if not expiry_list:
-                return None
+                logger.warning(f"⚠️ {symbol}: No expiry list from API, using fallback...")
+                # Fallback: Use default expiry based on today's date
+                today = datetime.now().date()
+                
+                if symbol_type == 'index':
+                    # Weekly expiry - next Thursday
+                    days_ahead = 3 - today.weekday()  # Thursday = 3
+                    if days_ahead <= 0:
+                        days_ahead += 7
+                    fallback_expiry = today + timedelta(days=days_ahead)
+                else:
+                    # Monthly expiry - last Thursday of current month
+                    import calendar
+                    last_day = calendar.monthrange(today.year, today.month)[1]
+                    last_date = datetime(today.year, today.month, last_day).date()
+                    
+                    # Find last Thursday
+                    days_back = (last_date.weekday() - 3) % 7
+                    fallback_expiry = last_date - timedelta(days=days_back)
+                    
+                    # If already passed, use next month
+                    if fallback_expiry < today:
+                        next_month = today.month + 1 if today.month < 12 else 1
+                        next_year = today.year if today.month < 12 else today.year + 1
+                        last_day_next = calendar.monthrange(next_year, next_month)[1]
+                        last_date_next = datetime(next_year, next_month, last_day_next).date()
+                        days_back = (last_date_next.weekday() - 3) % 7
+                        fallback_expiry = last_date_next - timedelta(days=days_back)
+                
+                selected_expiry = fallback_expiry.strftime('%Y-%m-%d')
+                logger.info(f"📅 {symbol}: Using fallback expiry: {selected_expiry}")
+                self.expiry_map[symbol] = selected_expiry
+                return selected_expiry
             
-            # Select best expiry
+            # Select best expiry from list
             selected_expiry = self.select_best_expiry(symbol, expiry_list, symbol_type)
             
             # Check if expiry changed
@@ -314,6 +399,8 @@ class AIOptionTradingBot:
             
         except Exception as e:
             logger.error(f"❌ Error updating expiry: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
     
     async def get_option_chain_safe(self, security_id, segment, expiry):
@@ -706,12 +793,9 @@ class AIOptionTradingBot:
                 
                 logger.info(f"📊 Analyzing {symbol} ({symbol_type})...")
                 
-                # 🆕 Update expiry (auto-rollover)
-                expiry = self.update_expiry_for_symbol(symbol, security_id, segment, symbol_type)
-                
-                if not expiry:
-                    logger.warning(f"⚠️ {symbol}: No expiry found, skipping...")
-                    continue
+                # 🆕 Use fallback expiry (skip API call for faster execution)
+                expiry = self.get_fallback_expiry(symbol, symbol_type)
+                logger.info(f"📅 {symbol}: Using expiry: {expiry}")
                 
                 # 🆕 Multi-timeframe data
                 multi_tf_data = await self.get_multi_timeframe_data(security_id, segment)
