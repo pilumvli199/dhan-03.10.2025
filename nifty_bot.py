@@ -468,7 +468,7 @@ Use OPTION premiums only. SL < Entry < Target. RR >= 2.0"""
                 return None
             
             if analysis['signal'] in ['BUY_CE', 'BUY_PE']:
-                if analysis['stop_loss'] >= analysis['entry_price'] or analysis['target'] <= analysis['entry_price'] or analysis['confidence'] < 70:
+                if analysis['stop_loss'] >= analysis['entry_price'] or analysis['target'] <= analysis['entry_price'] or analysis['confidence'] < 65:
                     return None
             
             logger.info(f"AI: {analysis['signal']} @ Rs{analysis.get('entry_price', 0):.2f}")
@@ -525,6 +525,8 @@ Use OPTION premiums only. SL < Entry < Target. RR >= 2.0"""
             
             if ai_analysis and ai_analysis['signal'] in ['BUY_CE', 'BUY_PE']:
                 await self.send_trade_signal(symbol, ai_analysis, technical_data, option_data, expiry)
+            else:
+                logger.info(f"{symbol}: NO_TRADE - {ai_analysis.get('reasoning', 'No clear signal') if ai_analysis else 'Analysis failed'}")
             
         except Exception as e:
             logger.error(f"Analysis error: {e}")
