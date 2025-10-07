@@ -598,7 +598,6 @@ class AIOptionTradingBot:
                 temperature=0.2,
                 max_tokens=500
             )
-            )
             
             ai_response = response.choices[0].message.content.strip()
             
